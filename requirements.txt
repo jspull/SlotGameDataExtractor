@@ -1,0 +1,8 @@
+opencv-python
+easyocr
+PyQt5
+pandas
+openpyxl
+matplotlib
+numpy
+transformers
