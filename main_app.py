@@ -9,7 +9,8 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QFileDialog,
                              QProgressBar, QTableWidget, QTableWidgetItem, QMessageBox,
                              QHeaderView, QSplitter, QTabWidget, QComboBox, QSizePolicy,
-                             QLineEdit, QSlider, QStyle, QDialog, QDoubleSpinBox)
+                             QLineEdit, QSlider, QStyle, QDialog, QDoubleSpinBox,
+                             QCheckBox, QSpinBox, QGroupBox)
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QFont, QIcon
 import json
@@ -100,6 +101,134 @@ class ClickableSlider(QSlider):
             self.setValue(val)
             self.sliderMoved.emit(val)
         super().mouseMoveEvent(event)
+
+
+# ── ROI Filter Tuning Dialog ────────────────────────────────────────
+class RoiFilterDialog(QDialog):
+    """ROI별 밝기/대비/이진화 필터를 슬라이더로 조정하고 실시간 미리보기하는 다이얼로그 (v44 포팅)"""
+    def __init__(self, roi_type_label, roi_gray_img, current_filter=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"ROI Filter Tuning ({roi_type_label})")
+        self.setMinimumSize(520, 450)
+        self.roi_gray = roi_gray_img
+        self.result_filter = None  # None = 취소, dict = 확정
+
+        ref = {"brightness": 0, "contrast": 100, "threshold_on": 0, "block_size": 11}
+        if current_filter:
+            ref.update(current_filter)
+
+        layout = QVBoxLayout(self)
+
+        # 미리보기 영역
+        self.preview_label = QLabel("Preview")
+        self.preview_label.setAlignment(Qt.AlignCenter)
+        self.preview_label.setMinimumSize(480, 130)
+        self.preview_label.setStyleSheet("background-color: #222; border: 1px solid #333; border-radius: 4px;")
+        layout.addWidget(self.preview_label)
+
+        # 밝기 슬라이더
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("밝기:"))
+        self.slider_brightness = QSlider(Qt.Horizontal)
+        self.slider_brightness.setRange(-100, 100)
+        self.slider_brightness.setValue(ref["brightness"])
+        self.lbl_brightness_val = QLabel(str(ref["brightness"]))
+        self.lbl_brightness_val.setFixedWidth(35)
+        self.slider_brightness.valueChanged.connect(lambda v: (self.lbl_brightness_val.setText(str(v)), self._update_preview()))
+        row1.addWidget(self.slider_brightness, 1)
+        row1.addWidget(self.lbl_brightness_val)
+        layout.addLayout(row1)
+
+        # 대비 슬라이더
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("대비%:"))
+        self.slider_contrast = QSlider(Qt.Horizontal)
+        self.slider_contrast.setRange(50, 200)
+        self.slider_contrast.setValue(ref["contrast"])
+        self.lbl_contrast_val = QLabel(str(ref["contrast"]))
+        self.lbl_contrast_val.setFixedWidth(35)
+        self.slider_contrast.valueChanged.connect(lambda v: (self.lbl_contrast_val.setText(str(v)), self._update_preview()))
+        row2.addWidget(self.slider_contrast, 1)
+        row2.addWidget(self.lbl_contrast_val)
+        layout.addLayout(row2)
+
+        # 이진화 체크 + 블록크기
+        row3 = QHBoxLayout()
+        self.chk_threshold = QCheckBox("이진화")
+        self.chk_threshold.setChecked(bool(ref["threshold_on"]))
+        self.chk_threshold.stateChanged.connect(lambda: self._update_preview())
+        row3.addWidget(self.chk_threshold)
+        row3.addWidget(QLabel("블록크기:"))
+        self.spin_block = QSpinBox()
+        self.spin_block.setRange(3, 31)
+        self.spin_block.setSingleStep(2)
+        self.spin_block.setValue(ref["block_size"])
+        self.spin_block.valueChanged.connect(lambda: self._update_preview())
+        row3.addWidget(self.spin_block)
+        row3.addStretch()
+        layout.addLayout(row3)
+
+        # 버튼
+        btn_row = QHBoxLayout()
+        btn_confirm = QPushButton("✅ 확정 (이 필터 저장)")
+        btn_confirm.setStyleSheet("background-color: #0f3460; color: #00d4aa; font-weight: bold; padding: 8px;")
+        btn_confirm.clicked.connect(self._on_confirm)
+        btn_skip = QPushButton("⏭ 스킵 (필터 없음)")
+        btn_skip.setStyleSheet("padding: 8px;")
+        btn_skip.clicked.connect(self.reject)
+        btn_row.addWidget(btn_confirm)
+        btn_row.addWidget(btn_skip)
+        layout.addLayout(btn_row)
+
+        self._update_preview()
+
+    def _build_filter(self):
+        bs = self.spin_block.value()
+        if bs % 2 == 0:
+            bs += 1
+        return {
+            "brightness": self.slider_brightness.value(),
+            "contrast": self.slider_contrast.value(),
+            "threshold_on": 1 if self.chk_threshold.isChecked() else 0,
+            "block_size": max(3, bs)
+        }
+
+    @staticmethod
+    def apply_roi_filter(gray_img, filter_dict):
+        """필터를 적용한 이미지 반환 (extractor에서도 동일 로직 사용)"""
+        if filter_dict is None or not filter_dict:
+            return gray_img
+        img = gray_img.astype(np.float64)
+        contrast = filter_dict.get("contrast", 100) / 100.0
+        brightness = filter_dict.get("brightness", 0)
+        img = img * contrast + brightness
+        img = np.clip(img, 0, 255).astype(np.uint8)
+        if filter_dict.get("threshold_on", 0):
+            bs = filter_dict.get("block_size", 11)
+            if bs % 2 == 0:
+                bs += 1
+            img = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, bs, 2)
+        return img
+
+    def _update_preview(self):
+        fd = self._build_filter()
+        out = RoiFilterDialog.apply_roi_filter(self.roi_gray.copy(), fd)
+        h, w = out.shape[:2]
+        canvas_w, canvas_h = 480, 120
+        scale = min(canvas_w / max(w, 1), canvas_h / max(h, 1), 5.0)
+        nw, nh = max(int(w * scale), 1), max(int(h * scale), 1)
+        resized = cv2.resize(out, (nw, nh), interpolation=cv2.INTER_NEAREST)
+        if len(resized.shape) == 2:
+            rgb = cv2.cvtColor(resized, cv2.COLOR_GRAY2RGB)
+        else:
+            rgb = resized
+        h2, w2, ch = rgb.shape
+        qimg = QImage(rgb.data, w2, h2, ch * w2, QImage.Format_RGB888)
+        self.preview_label.setPixmap(QPixmap.fromImage(qimg))
+
+    def _on_confirm(self):
+        self.result_filter = self._build_filter()
+        self.accept()
 
 
 # ── Time Input with Auto-Formatting ─────────────────────────────────
@@ -520,6 +649,8 @@ class MainWindow(QMainWindow):
 
         # ROI / state
         self.roi_event = None  # Event detection ROI
+        self.roi_bal_filter = None  # Balance OCR 전처리 필터 dict
+        self.roi_win_filter = None  # Win OCR 전처리 필터 dict
         root_layout.setSpacing(8)
 
         # ── Title ──
@@ -583,6 +714,16 @@ class MainWindow(QMainWindow):
         self.txt_fixed_bet.setPlaceholderText("e.g. 10,000")
         self.txt_fixed_bet.setToolTip("고정 배팅액. 입력 시 모든 스핀의 Bet을 이 값으로 강제 적용")
 
+        # Stability Threshold input (안정 감지 %, 낮을수록 민감)
+        lbl_stab = QLabel("Stab%:")
+        self.spin_stability = QDoubleSpinBox()
+        self.spin_stability.setRange(0.0, 50.0)
+        self.spin_stability.setSingleStep(0.1)
+        self.spin_stability.setValue(0.5)
+        self.spin_stability.setDecimals(1)
+        self.spin_stability.setFixedWidth(55)
+        self.spin_stability.setToolTip("ROI 픽셀 변화율(%). 0=변화감지 OFF(매 프레임 OCR). 낮을수록 민감")
+
         for b in [self.btn_select, self.btn_roi, self.btn_start, self.btn_stop,
                   self.btn_save_proj, self.btn_load_proj, self.btn_reset]:
             b.setMinimumHeight(36)
@@ -595,6 +736,13 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.txt_bal_filter)
         toolbar.addWidget(lbl_fixed_bet)
         toolbar.addWidget(self.txt_fixed_bet)
+        toolbar.addWidget(lbl_stab)
+        toolbar.addWidget(self.spin_stability)
+
+        # Drop Only Spin 옵션
+        self.chk_drop_only = QCheckBox("Drop Only")
+        self.chk_drop_only.setToolTip("ON: Balance 하락 시에만 스핀 카운트 (롤업 안착은 baseline 갱신만)")
+        toolbar.addWidget(self.chk_drop_only)
 
         toolbar.addWidget(self.lbl_file, 1)
         root_layout.addLayout(toolbar)
@@ -716,8 +864,8 @@ class MainWindow(QMainWindow):
         raw_layout = QVBoxLayout(raw_tab)
         raw_layout.setContentsMargins(6, 6, 6, 6)
         
-        from PyQt5.QtWidgets import QTextEdit
-        self.txt_raw_log = QTextEdit()
+        from PyQt5.QtWidgets import QPlainTextEdit
+        self.txt_raw_log = QPlainTextEdit()
         self.txt_raw_log.setReadOnly(True)
         self.txt_raw_log.setStyleSheet("font-family: Consolas, monospace; font-size: 11px; background-color: #0b1120; color: #a5b4fc;")
         
@@ -868,12 +1016,31 @@ class MainWindow(QMainWindow):
         cv2.destroyAllWindows()
 
         self.roi_bal = roi_bal
+
+        # ── Balance ROI 필터 튜닝 다이얼로그 ──
+        bx, by, bw, bh = roi_bal
+        bal_crop_gray = cv2.cvtColor(frame[by:by+bh, bx:bx+bw], cv2.COLOR_BGR2GRAY)
+        bal_dlg = RoiFilterDialog("Balance", bal_crop_gray, self.roi_bal_filter, self)
+        if bal_dlg.exec_() == QDialog.Accepted:
+            self.roi_bal_filter = bal_dlg.result_filter
+        else:
+            self.roi_bal_filter = None
+
         if roi_win_scaled == (0,0,0,0) or roi_win_scaled[2]==0 or roi_win_scaled[3]==0:
             self.roi_win = None
+            self.roi_win_filter = None
             self.btn_start.setEnabled(True)
             self.lbl_status.setText("ROI set ✓ (Balance only) → Press Start")
         else:
             self.roi_win = tuple(int(v / scale) for v in roi_win_scaled)
+            # ── Win ROI 필터 튜닝 다이얼로그 ──
+            wx2, wy2, ww2, wh2 = self.roi_win
+            win_crop_gray = cv2.cvtColor(frame[wy2:wy2+wh2, wx2:wx2+ww2], cv2.COLOR_BGR2GRAY)
+            win_dlg = RoiFilterDialog("Win", win_crop_gray, self.roi_win_filter, self)
+            if win_dlg.exec_() == QDialog.Accepted:
+                self.roi_win_filter = win_dlg.result_filter
+            else:
+                self.roi_win_filter = None
             self.btn_start.setEnabled(True)
             self.lbl_status.setText("ROI set ✓ → Press Start")
 
@@ -962,7 +1129,11 @@ class MainWindow(QMainWindow):
             clip_threshold=self.spin_clip_th.value(),
             event_entries=self._get_event_entries(),
             bal_filter=bal_filter_val,
-            fixed_bet=fixed_bet_val
+            fixed_bet=fixed_bet_val,
+            roi_bal_filter=self.roi_bal_filter,
+            roi_win_filter=self.roi_win_filter,
+            stability_pct=self.spin_stability.value(),
+            drop_only_spin=self.chk_drop_only.isChecked()
         )
         self.extractor_thread.progress_signal.connect(self.update_progress)
         self.extractor_thread.data_signal.connect(
@@ -1006,7 +1177,7 @@ class MainWindow(QMainWindow):
         if col in [2, 3, 4]:
             try:
                 val = float(text)
-                item.setText(f"{val:,.2f}")
+                item.setText(f"{val:,.0f}")
             except ValueError:
                 pass
 
@@ -1015,60 +1186,81 @@ class MainWindow(QMainWindow):
         self.table.blockSignals(False)
 
     def sync_data_from_table(self):
+        was_blocked = self.table.signalsBlocked()
+        if not was_blocked:
+            self.table.blockSignals(True)
+
         self.data_rows = []
         prev_bal = None
         for row in range(self.table.rowCount()):
+            # Event Type 확인
+            evt_item = self.table.item(row, 7)
+            event_type = evt_item.text().strip() if evt_item else ""
+            spin_item = self.table.item(row, 0)
+            spin_text = spin_item.text().strip() if spin_item else ""
+            is_event_row = bool(event_type) or not spin_text
+
             row_data = []
-            for col in range(6): # Spin#, Time, Bet, Balance, Win, Delta
+            for col in range(6):  # Spin#, Time, Bet, Balance, Win, Delta(placeholder)
                 it = self.table.item(row, col)
                 val_str = it.text().replace(',', '') if it else "0"
-                if col != 1: # Not time
+                if col != 1:  # Not time
                     try: row_data.append(float(val_str))
                     except: row_data.append(0.0)
                 else:
                     row_data.append(val_str)
 
-            # Recalculate Delta Balance
-            current_bal = row_data[3]  # Balance
-            current_bet = row_data[2]  # Bet
-            delta = current_bal - prev_bal if prev_bal is not None else 0.0
-            prev_bal = current_bal
-            delta_plus_bet = delta + current_bet  # Δ Bal+Bet = 실질 수익
+            # Event 전용 행은 Delta 계산에서 제외
+            if is_event_row:
+                delta = 0.0
+                delta_plus_bet = 0.0
+                # Delta/Bal+Bet 셀 비우기
+                d_item = self.table.item(row, 5)
+                if d_item: d_item.setText("")
+                dbp_item = self.table.item(row, 6)
+                if dbp_item: dbp_item.setText("")
+            else:
+                # 스핀 행: Delta 계산
+                current_bal = row_data[3]  # Balance
+                current_bet = row_data[2]  # Bet
+                delta = current_bal - prev_bal if prev_bal is not None else 0.0
+                prev_bal = current_bal
+                delta_plus_bet = delta + current_bet  # Δ Bal+Bet = 실질 수익
 
-            # Update Delta Balance UI
-            delta_item = self.table.item(row, 5)
-            if delta_item:
-                delta_item.setText(f"{delta:+,.2f}")
-                if delta > 0: delta_item.setForeground(Qt.green)
-                elif delta < 0: delta_item.setForeground(Qt.red)
-                else: delta_item.setForeground(Qt.gray)
+                # Update Delta Balance UI
+                delta_item = self.table.item(row, 5)
+                if delta_item:
+                    delta_item.setText(f"{delta:+,.0f}")
+                    if delta > 0: delta_item.setForeground(Qt.green)
+                    elif delta < 0: delta_item.setForeground(Qt.red)
+                    else: delta_item.setForeground(Qt.gray)
 
-            # Δ Bal+Bet → 이전 스핀 행에 기록
-            # 현재 행은 빈 셀
-            dbp_item = self.table.item(row, 6)
-            if dbp_item:
-                dbp_item.setText("")
-            if row > 0:
-                for prev_row in range(row - 1, -1, -1):
-                    prev_spin_item = self.table.item(prev_row, 0)
-                    prev_evt_item = self.table.item(prev_row, 7)
-                    if prev_spin_item and prev_spin_item.text().strip() and not (prev_evt_item and prev_evt_item.text().strip()):
-                        prev_dbp = self.table.item(prev_row, 6)
-                        if prev_dbp:
-                            prev_dbp.setText(f"{delta_plus_bet:+,.2f}")
-                            if delta_plus_bet > 0: prev_dbp.setForeground(Qt.green)
-                            elif delta_plus_bet < 0: prev_dbp.setForeground(Qt.red)
-                            else: prev_dbp.setForeground(Qt.gray)
-                        break
+                # Δ Bal+Bet → 이전 스핀 행에 기록
+                # 현재 행의 Bal+Bet 셀은 비움
+                dbp_item = self.table.item(row, 6)
+                if dbp_item:
+                    dbp_item.setText("")
+                if row > 0:
+                    for prev_row in range(row - 1, -1, -1):
+                        prev_spin_item = self.table.item(prev_row, 0)
+                        prev_evt_item = self.table.item(prev_row, 7)
+                        if prev_spin_item and prev_spin_item.text().strip() and not (prev_evt_item and prev_evt_item.text().strip()):
+                            prev_dbp = self.table.item(prev_row, 6)
+                            if prev_dbp:
+                                prev_dbp.setText(f"{delta_plus_bet:+,.0f}")
+                                if delta_plus_bet > 0: prev_dbp.setForeground(Qt.green)
+                                elif delta_plus_bet < 0: prev_dbp.setForeground(Qt.red)
+                                else: prev_dbp.setForeground(Qt.gray)
+                            break
 
             # data_rows: [Spin#, Time, Bet, Balance, Win, Delta, DeltaPlusBet, EventType]
             row_data.append(delta)
             row_data.append(delta_plus_bet)
-            # Event Type (now column 7)
-            evt_item = self.table.item(row, 7)
-            event_type = evt_item.text() if evt_item else ""
             row_data.append(event_type)
             self.data_rows.append(row_data)
+
+        if not was_blocked:
+            self.table.blockSignals(False)
 
         self.graph_tab.set_data(self.data_rows)
 
@@ -1085,11 +1277,11 @@ class MainWindow(QMainWindow):
         self.table.insertRow(insert_pos)
         self.table.setItem(insert_pos, 0, QTableWidgetItem("0"))
         self.table.setItem(insert_pos, 1, QTableWidgetItem("00:00:00"))
-        self.table.setItem(insert_pos, 2, QTableWidgetItem("0.00"))
-        self.table.setItem(insert_pos, 3, QTableWidgetItem("0.00"))
-        self.table.setItem(insert_pos, 4, QTableWidgetItem("0.00"))
-        self.table.setItem(insert_pos, 5, QTableWidgetItem("+0.00"))
-        self.table.setItem(insert_pos, 6, QTableWidgetItem("+0.00"))
+        self.table.setItem(insert_pos, 2, QTableWidgetItem("0"))
+        self.table.setItem(insert_pos, 3, QTableWidgetItem("0"))
+        self.table.setItem(insert_pos, 4, QTableWidgetItem("0"))
+        self.table.setItem(insert_pos, 5, QTableWidgetItem("+0"))
+        self.table.setItem(insert_pos, 6, QTableWidgetItem("+0"))
         self.table.setItem(insert_pos, 7, QTableWidgetItem(""))
 
         btn = QPushButton("Go")
@@ -1160,7 +1352,7 @@ class MainWindow(QMainWindow):
 
     def on_raw_log(self, msg):
         try:
-            self.txt_raw_log.append(str(msg))
+            self.txt_raw_log.appendPlainText(str(msg))
             # Scroll to bottom automatically
             scrollbar = self.txt_raw_log.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
@@ -1191,9 +1383,9 @@ class MainWindow(QMainWindow):
         else:
             delta = balance - self.prev_balance if self.prev_balance is not None else 0.0
             self.prev_balance = balance
-            delta_str = f"{delta:+,.2f}"  # +1,000.00 or -500.00
+            delta_str = f"{delta:+,.0f}"  # +1,000 or -500
             dbp = delta + bet  # Δ Balance + Bet = 실질 수익
-            dbp_str = f"{dbp:+,.2f}"
+            dbp_str = f"{dbp:+,.0f}"
 
         self.table.blockSignals(True)
 
@@ -1211,9 +1403,9 @@ class MainWindow(QMainWindow):
         else:
             self.table.setItem(row, 0, QTableWidgetItem(str(spin)))
             self.table.setItem(row, 1, QTableWidgetItem(time_str))
-            self.table.setItem(row, 2, QTableWidgetItem(f"{bet:,.2f}"))
-            self.table.setItem(row, 3, QTableWidgetItem(f"{balance:,.2f}"))
-            self.table.setItem(row, 4, QTableWidgetItem(f"{win:,.2f}"))
+            self.table.setItem(row, 2, QTableWidgetItem(f"{bet:,.0f}"))
+            self.table.setItem(row, 3, QTableWidgetItem(f"{balance:,.0f}"))
+            self.table.setItem(row, 4, QTableWidgetItem(f"{win:,.0f}"))
 
             # Δ Balance cell with color
             delta_item = QTableWidgetItem(delta_str)
@@ -1362,6 +1554,8 @@ class MainWindow(QMainWindow):
         self.roi_bal = None
         self.roi_win = None
         self.roi_event = None
+        self.roi_bal_filter = None
+        self.roi_win_filter = None
         self.elapsed_time = ""
         self.prev_balance = None
         self.lbl_file.setText("No file selected")
@@ -1385,27 +1579,30 @@ class MainWindow(QMainWindow):
             return
         headers = ["Spin #", "Time", "Bet", "Balance", "Win", "Δ Balance", "Δ Bal+Bet", "Event Type"]
 
-        # Δ Bal+Bet 값을 한 행 위로 시프트 (이전 스핀에 기록)
-        # 먼저 모든 행의 dbp 값을 추출
-        all_dbp = []
-        for r in self.data_rows:
-            dbp = r[6] if len(r) > 6 else 0.0
-            all_dbp.append(dbp)
-
-        # 시프트: [dbp1, dbp2, dbp3, ...] → 이전 행 매핑: [dbp2→row1, dbp3→row2, ... , ""→last]
-        shifted_dbp = all_dbp[1:] + [None]  # 마지막 행은 빈 값
-
         rows = []
         for i, r in enumerate(self.data_rows):
-            delta = r[5] if len(r) > 5 else 0.0
-            dbp_val = shifted_dbp[i]
-            event = r[7] if len(r) > 7 else ""
-            # data_rows order: [Spin#, Time, Bet, Balance, Win, Delta, DeltaPlusBet, Event]
             try:
-                dbp_str = f"{float(dbp_val):+,.2f}" if dbp_val is not None else ""
-                rows.append([r[0], r[1], f"{float(r[2]):,.2f}", f"{float(r[3]):,.2f}", f"{float(r[4]):,.2f}", f"{float(delta):+,.2f}", dbp_str, event])
+                spin_val = str(int(r[0])) if r[0] != "" and r[0] != 0.0 else ""
             except (ValueError, TypeError):
-                rows.append([r[0], r[1], r[2], r[3], r[4], delta, "", event])
+                spin_val = str(r[0]) if r[0] else ""
+            time_val = str(r[1]) if len(r) > 1 else ""
+            event = str(r[7]) if len(r) > 7 else ""
+
+            # 숫자 컨럼은 float 그대로 (Excel 숫자 형식)
+            try:
+                bet_val = float(r[2]) if r[2] != "" else None
+                bal_val = float(r[3]) if r[3] != "" else None
+                win_val = float(r[4]) if r[4] != "" else None
+                delta_val = float(r[5]) if r[5] != "" else None
+                dbp_val = float(r[6]) if r[6] != "" else None
+            except (ValueError, TypeError):
+                bet_val = r[2] if len(r) > 2 else None
+                bal_val = r[3] if len(r) > 3 else None
+                win_val = r[4] if len(r) > 4 else None
+                delta_val = r[5] if len(r) > 5 else None
+                dbp_val = r[6] if len(r) > 6 else None
+
+            rows.append([spin_val, time_val, bet_val, bal_val, win_val, delta_val, dbp_val, event])
 
         df = pd.DataFrame(rows, columns=headers)
 
@@ -1415,7 +1612,14 @@ class MainWindow(QMainWindow):
             df = pd.concat([df, elapsed_row], ignore_index=True)
 
         try:
-            df.to_excel(path, index=False)
+            with pd.ExcelWriter(path, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False, sheet_name='Data')
+                ws = writer.sheets['Data']
+                # 숫자 컨럼에 쉼표 포맷 적용 (Bet, Balance, Win, Δ Balance, Δ Bal+Bet = col C~G)
+                for col_letter in ['C', 'D', 'E', 'F', 'G']:
+                    for cell in ws[col_letter][1:]:  # 헤더 제외
+                        if cell.value is not None and isinstance(cell.value, (int, float)):
+                            cell.number_format = '#,##0'
             QMessageBox.information(self, "Export", f"Data exported successfully.\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
@@ -1472,6 +1676,8 @@ class MainWindow(QMainWindow):
             "roi_bal": list(self.roi_bal) if self.roi_bal else None,
             "roi_win": list(self.roi_win) if self.roi_win else None,
             "roi_event": list(self.roi_event) if self.roi_event else None,
+            "roi_bal_filter": self.roi_bal_filter,
+            "roi_win_filter": self.roi_win_filter,
             "data_rows": self.data_rows,
             "start_time": self.txt_start_time.text(),
             "clip_threshold": self.spin_clip_th.value(),
@@ -1508,6 +1714,8 @@ class MainWindow(QMainWindow):
             if rb: self.roi_bal = tuple(rb)
             if rw: self.roi_win = tuple(rw)
             if re_: self.roi_event = tuple(re_)
+            self.roi_bal_filter = data.get("roi_bal_filter")
+            self.roi_win_filter = data.get("roi_win_filter")
 
             if self.roi_bal:
                 self.btn_start.setEnabled(True)

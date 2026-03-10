@@ -36,7 +36,9 @@ class ExtractorThread(QThread):
     elapsed_signal = pyqtSignal(str)
 
     def __init__(self, video_path, roi_bal, roi_win, roi_event=None, start_frame=0, 
-                 clip_threshold=0.5, event_entries=None, bal_filter=None, fixed_bet=None):
+                 clip_threshold=0.5, event_entries=None, bal_filter=None, fixed_bet=None,
+                 roi_bal_filter=None, roi_win_filter=None, stability_pct=0.5,
+                 drop_only_spin=False):
         super().__init__()
         self.video_path = video_path
         self.roi_bal = roi_bal
@@ -46,6 +48,10 @@ class ExtractorThread(QThread):
         self.clip_threshold = clip_threshold
         self.bal_filter = bal_filter
         self.fixed_bet = fixed_bet
+        self.roi_bal_filter = roi_bal_filter
+        self.roi_win_filter = roi_win_filter
+        self.stability_pct = stability_pct  # 안정 감지 임계값 (%)
+        self.drop_only_spin = drop_only_spin  # Drop Only Spin 모드
         self._is_stopped = False
         
         # 동적 이벤트 라벨 구성
@@ -144,20 +150,42 @@ class ExtractorThread(QThread):
             start_time = time.time()
             self.status_signal.emit(f"Processing Video (EasyOCR, {gpu_msg}). Extracting data...")
 
-            # Balance ROI용: 기존 방식 (scaled → thresh → gray, 최대 3회)
+            # ROI 필터 적용 함수 (v44 포팅)
+            def _apply_roi_filter(gray_img, filter_dict):
+                """ROI에 밝기/대비/이진화 필터 적용"""
+                if filter_dict is None or not filter_dict:
+                    return gray_img
+                img = gray_img.astype(np.float64)
+                contrast = filter_dict.get("contrast", 100) / 100.0
+                brightness = filter_dict.get("brightness", 0)
+                img = img * contrast + brightness
+                img = np.clip(img, 0, 255).astype(np.uint8)
+                if filter_dict.get("threshold_on", 0):
+                    bs = filter_dict.get("block_size", 11)
+                    if bs % 2 == 0:
+                        bs += 1
+                    img = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, bs, 2)
+                return img
+
+            # Balance ROI용: 사용자 필터 적용 → OCR
             def read_roi(roi, frame_img):
                 x, y, w, h = roi
                 roi_frame = frame_img[y:y+h, x:x+w]
                 gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
                 scaled = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-                _, thresh = cv2.threshold(scaled, 120, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+                # 사용자 필터가 있으면 필터 적용, 없으면 Otsu 폴백
+                if self.roi_bal_filter:
+                    filtered = _apply_roi_filter(scaled, self.roi_bal_filter)
+                else:
+                    _, filtered = cv2.threshold(scaled, 120, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
 
                 def read_img(img):
                     res = easy_reader.readtext(img, detail=0)
                     return " ".join(res).strip() if res else ""
 
-                text = read_img(scaled)
-                if not text: text = read_img(thresh)
+                text = read_img(filtered)
+                if not text: text = read_img(scaled)
                 if not text: text = read_img(gray)
                 if not text: return None
 
@@ -182,16 +210,21 @@ class ExtractorThread(QThread):
                 try: return float(clean)
                 except ValueError: return None
 
-            # Win ROI 전용: thresh만 1회 시도 (이펙트 제거 + 속도 최적화)
+            # Win ROI용: 사용자 필터 적용 → OCR
             def read_roi_win(roi, frame_img):
                 x, y, w, h = roi
                 roi_frame = frame_img[y:y+h, x:x+w]
                 gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
                 scaled = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-                _, thresh = cv2.threshold(scaled, 120, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
 
-                # thresh 이미지 1회만 시도 (이펙트가 이진화로 제거됨)
-                res = easy_reader.readtext(thresh, detail=0)
+                # 사용자 필터가 있으면 필터 적용, 없으면 Otsu 폴백
+                if self.roi_win_filter:
+                    filtered = _apply_roi_filter(scaled, self.roi_win_filter)
+                else:
+                    _, filtered = cv2.threshold(scaled, 120, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+                # filtered 이미지 1회만 시도
+                res = easy_reader.readtext(filtered, detail=0)
                 text = " ".join(res).strip() if res else ""
                 if not text: return None
 
@@ -231,10 +264,10 @@ class ExtractorThread(QThread):
                             return True, most_common_val
                 return False, None
 
-            # --- 2-Stage Pipeline (10초 딜레이) 데이터 버퍼 및 로직처리기 준비 ---
+            # --- 2-Stage Pipeline (2초 딜레이) 데이터 버퍼 및 로직처리기 준비 ---
             raw_buffer = []  # 감지된 데이터를 쌓아둘 버퍼: (frame_idx, time_sec, raw_bal, raw_win, clip_event)
             fps_int = int(fps)
-            logic_processor = LogicProcessor(fps_int, self.data_signal, self.bal_filter, self.fixed_bet)
+            logic_processor = LogicProcessor(fps_int, self.data_signal, self.bal_filter, self.fixed_bet, self.drop_only_spin)
 
             # --- absdiff 기반 변화 감지 변수 (v44 속도 기법 도입) ---
             # 이전 프레임의 흑백 ROI 이미지 보관용
@@ -288,23 +321,30 @@ class ExtractorThread(QThread):
                 raw_bal = None
 
                 if prev_bal_gray is not None:
-                    diff_pixels = np.sum(cv2.absdiff(prev_bal_gray, bal_gray) > 25)
-                    total_pixels = bw * bh
-                    if total_pixels > 0 and diff_pixels < total_pixels * 0.005:  # 0.5% 미만 변화 → 안정
-                        bal_stable_count += 1
-                    else:
-                        bal_stable_count = 0  # 변화 발생 → 리셋
-
-                    if bal_stable_count == stability_threshold:
-                        # 🎯 안정 확정! 이 순간에만 OCR 1회 호출
+                    if self.stability_pct <= 0:
+                        # Stab% = 0 → 변화 감지 OFF, 매 프레임 OCR
                         ocr_result = read_roi(self.roi_bal, frame)
                         if ocr_result is not None:
                             last_ocr_bal = ocr_result
                         raw_bal = last_ocr_bal
-                    elif bal_stable_count > stability_threshold:
-                        # 안정 유지 중 → 마지막 OCR 값 재사용 (OCR 재호출 안 함)
-                        raw_bal = last_ocr_bal
-                    # else: bal_stable_count < threshold → 아직 안정되지 않음 → raw_bal = None
+                    else:
+                        diff_pixels = np.sum(cv2.absdiff(prev_bal_gray, bal_gray) > 25)
+                        total_pixels = bw * bh
+                        if total_pixels > 0 and diff_pixels < total_pixels * (self.stability_pct / 100.0):  # Stab% 미만 변화 → 안정
+                            bal_stable_count += 1
+                        else:
+                            bal_stable_count = 0  # 변화 발생 → 리셋
+
+                        if bal_stable_count == stability_threshold:
+                            # 🎯 안정 확정! 이 순간에만 OCR 1회 호출
+                            ocr_result = read_roi(self.roi_bal, frame)
+                            if ocr_result is not None:
+                                last_ocr_bal = ocr_result
+                            raw_bal = last_ocr_bal
+                        elif bal_stable_count > stability_threshold:
+                            # 안정 유지 중 → 마지막 OCR 값 재사용 (OCR 재호출 안 함)
+                            raw_bal = last_ocr_bal
+                        # else: bal_stable_count < threshold → 아직 안정되지 않음 → raw_bal = None
                 prev_bal_gray = bal_gray.copy()
 
                 # ── Win ROI 변화 감지 ──
@@ -314,20 +354,27 @@ class ExtractorThread(QThread):
                     win_gray = cv2.cvtColor(frame[wy:wy+wh, wx:wx+ww], cv2.COLOR_BGR2GRAY)
 
                     if prev_win_gray is not None:
-                        diff_pixels_w = np.sum(cv2.absdiff(prev_win_gray, win_gray) > 25)
-                        total_pixels_w = ww * wh
-                        if total_pixels_w > 0 and diff_pixels_w < total_pixels_w * 0.005:
-                            win_stable_count += 1
-                        else:
-                            win_stable_count = 0
-
-                        if win_stable_count == stability_threshold:
+                        if self.stability_pct <= 0:
+                            # Stab% = 0 → 변화 감지 OFF, 매 프레임 OCR
                             ocr_win_result = read_roi_win(self.roi_win, frame)
                             if ocr_win_result is not None:
                                 last_ocr_win = ocr_win_result
                             raw_win = last_ocr_win
-                        elif win_stable_count > stability_threshold:
-                            raw_win = last_ocr_win
+                        else:
+                            diff_pixels_w = np.sum(cv2.absdiff(prev_win_gray, win_gray) > 25)
+                            total_pixels_w = ww * wh
+                            if total_pixels_w > 0 and diff_pixels_w < total_pixels_w * (self.stability_pct / 100.0):
+                                win_stable_count += 1
+                            else:
+                                win_stable_count = 0
+
+                            if win_stable_count == stability_threshold:
+                                ocr_win_result = read_roi_win(self.roi_win, frame)
+                                if ocr_win_result is not None:
+                                    last_ocr_win = ocr_win_result
+                                raw_win = last_ocr_win
+                            elif win_stable_count > stability_threshold:
+                                raw_win = last_ocr_win
                         # else: 안정되지 않음 → raw_win = 0.0 유지
                     prev_win_gray = win_gray.copy()
 
@@ -353,20 +400,20 @@ class ExtractorThread(QThread):
                     "clip_event": clip_event
                 })
 
-                # 4. 버퍼 누적 시, 10초 이전 과거의 데이터(미래 문맥 확보분)만 로직 처리기로 밀어내기
-                #    예: 현재 30초면, 20초까지의 버퍼만 처리. 미래의 10초(20~30초)는 분석을 위해 홀드
+                # 4. 버퍼 누적 시, 2초 이전 과거의 데이터(미래 문맥 확보분)만 로직 처리기로 밀어내기
+                #    예: 현재 30초면, 28초까지의 버퍼만 처리. 미래의 2초(28~30초)는 분석을 위해 홀드
                 if len(raw_buffer) > 0:
                     oldest_time = raw_buffer[0]["time_sec"]
-                    if time_sec - oldest_time >= 10.0:
-                        # 10.0초 시점 이상 차이나는 오래된 데이터들 분류
-                        ready_frames = [f for f in raw_buffer if time_sec - f["time_sec"] >= 10.0]
+                    if time_sec - oldest_time >= 2.0:
+                        # 2.0초 시점 이상 차이나는 오래된 데이터들 분류
+                        ready_frames = [f for f in raw_buffer if time_sec - f["time_sec"] >= 2.0]
                         if ready_frames:
                             # 로직 처리기에 넘기기
                             logic_processor.process_buffer(ready_frames, force_flush=False)
-                            # 남아있어야 할 10초 윈도우 데이터만 유지
-                            raw_buffer = [f for f in raw_buffer if time_sec - f["time_sec"] < 10.0]
+                            # 남아있어야 할 2초 윈도우 데이터만 유지
+                            raw_buffer = [f for f in raw_buffer if time_sec - f["time_sec"] < 2.0]
 
-            # 영상 처리가 완전히 끝나면(EOF), 잔여 버퍼 10초 분량을 강제로 처리
+            # 영상 처리가 완전히 끝나면(EOF), 잔여 버퍼 2초 분량을 강제로 처리
             if not self._is_stopped and raw_buffer:
                 logic_processor.process_buffer(raw_buffer, force_flush=True)
 
@@ -390,11 +437,12 @@ class LogicProcessor:
       높은 새 값으로 10프레임 연속 정지 → 롤업 스킵
     - fixed_bet이 설정되면 모든 스핀의 Bet을 해당 값으로 강제 기입
     """
-    def __init__(self, fps_int, data_signal, bal_filter=None, fixed_bet=None):
+    def __init__(self, fps_int, data_signal, bal_filter=None, fixed_bet=None, drop_only_spin=False):
         self.fps = fps_int
         self.data_signal = data_signal
         self.bal_filter = bal_filter
         self.fixed_bet = fixed_bet
+        self.drop_only_spin = drop_only_spin  # Drop Only Spin 모드
         
         self.spin_count = 0
         self.current_bal = None    # 매 프레임 최고점을 추적 (롤업 중에도 즉시 갱신)
@@ -406,7 +454,7 @@ class LogicProcessor:
         # 롤업 중간값이 current_bal을 올려버려도 비교 기준이 오염되지 않음
         self.spin_base_bal = None
         
-        # 3연속 값 확인을 위한 추적기 (하락 감지)
+        # 연속 값 확인을 위한 추적기 (하락 감지)
         self.last_raw_bal = None
         self.raw_bal_count = 0
         self.last_stable_bal = None
@@ -488,9 +536,13 @@ class LogicProcessor:
                 continue
 
             # ──────────────────────────────────────────────────
-            # 조건 1: 3프레임 연속 동일 → 하락(스핀) 여부 검사
+            # 조건 1: N프레임 연속 동일 → 하락(스핀) 여부 검사
+            # drop_only_spin ON: 10프레임 + 하락만 스핀 카운트
+            # drop_only_spin OFF: 3프레임 (기존)
             # ──────────────────────────────────────────────────
-            if self.raw_bal_count == 3:
+            drop_stable_frames = 3
+            
+            if self.raw_bal_count == drop_stable_frames:
                 stable_bal = f_bal
                 
                 # 가짜 피크(Noise) 제거
@@ -512,12 +564,10 @@ class LogicProcessor:
                     self.last_stable_bal = stable_bal
 
             # ──────────────────────────────────────────────────
-            # 조건 2: 10프레임 연속 동일 + 상승 → 롤업 스킵 스핀
+            # 조건 2: 10프레임 연속 동일 + 상승 → 롤업 안착 처리
+            # drop_only_spin OFF: 스핀 카운트 (기존 동작)
+            # drop_only_spin ON:  스핀 카운트 안 함, baseline만 갱신
             # ──────────────────────────────────────────────────
-            # ★ 핵심 수정: current_bal이 아니라 spin_base_bal과 비교!
-            # current_bal은 롤업 중 매 프레임 갱신되므로 항상 f_bal과 같아져서
-            # 조건이 절대 참이 될 수 없었음. spin_base_bal은 스핀 확정 시에만
-            # 갱신되므로 롤업 도중에도 비교 기준이 오염되지 않음.
             if self.spin_base_bal is not None and f_bal > self.spin_base_bal:
                 # spin_base_bal보다 높은 값이므로 상승 안착 후보
                 if f_bal == self.rise_stable_val:
@@ -527,9 +577,16 @@ class LogicProcessor:
                     self.rise_stable_count = 1
                 
                 if self.rise_stable_count >= 10:
-                    # 🎈 상승 안착 확정! 롤업 스킵 스핀
-                    bal_diff = f_bal - self.spin_base_bal
-                    self._emit_spin(time_sec, bal_diff, f_bal)
+                    if self.drop_only_spin:
+                        # 🔇 Drop Only: baseline만 조용히 갱신 (스핀 카운트 안 함)
+                        self.current_bal = f_bal
+                        self.current_win = 0.0
+                        self.last_stable_bal = f_bal
+                        self.spin_base_bal = f_bal
+                    else:
+                        # 🎈 상승 안착 확정! 롤업 스킵 스핀 (기존 동작)
+                        bal_diff = f_bal - self.spin_base_bal
+                        self._emit_spin(time_sec, bal_diff, f_bal)
                     
                     self.rise_stable_val = None
                     self.rise_stable_count = 0
