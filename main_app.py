@@ -1176,7 +1176,7 @@ class MainWindow(QMainWindow):
         text = item.text().replace(',', '')
 
         # Auto comma formatting for numeric columns (Bet, Balance, Win)
-        if col in [2, 3, 4]:
+        if col in [3, 4, 5]:
             try:
                 val = float(text)
                 item.setText(f"{val:,.0f}")
@@ -1195,42 +1195,66 @@ class MainWindow(QMainWindow):
         self.data_rows = []
         prev_bal = None
         for row in range(self.table.rowCount()):
-            # Event Type 확인
-            evt_item = self.table.item(row, 7)
+            # Event Type 행과 무관하게 Spin#가 존재하면 스핀 행으로 취급
+            evt_item = self.table.item(row, 8)
             event_type = evt_item.text().strip() if evt_item else ""
             spin_item = self.table.item(row, 0)
             spin_text = spin_item.text().strip() if spin_item else ""
-            is_event_row = bool(event_type) or not spin_text
+            is_event_row = not bool(spin_text)
 
             row_data = []
-            for col in range(6):  # Spin#, Time, Bet, Balance, Win, Delta(placeholder)
+            for col in range(6):  # Spin#, Time, Duration, Bet, Balance, Win
                 it = self.table.item(row, col)
                 val_str = it.text().replace(',', '') if it else "0"
-                if col != 1:  # Not time
+                if col in (1, 2):  # Time and Duration are strings
+                    row_data.append(val_str)
+                else:
                     try: row_data.append(float(val_str))
                     except: row_data.append(0.0)
-                else:
-                    row_data.append(val_str)
 
             # Event 전용 행은 Delta 계산에서 제외
             if is_event_row:
                 delta = 0.0
                 delta_plus_bet = 0.0
                 # Delta/Bal+Bet 셀 비우기
-                d_item = self.table.item(row, 5)
+                d_item = self.table.item(row, 6)
                 if d_item: d_item.setText("")
-                dbp_item = self.table.item(row, 6)
+                dbp_item = self.table.item(row, 7)
                 if dbp_item: dbp_item.setText("")
             else:
-                # 스핀 행: Delta 계산
-                current_bal = row_data[3]  # Balance
-                current_bet = row_data[2]  # Bet
+                # 스핀 행: Delta 계산 및 Duration(경과시간) 계산 자동 복원
+                current_bal = row_data[4]  # Balance
+                current_bet = row_data[3]  # Bet
                 delta = current_bal - prev_bal if prev_bal is not None else 0.0
                 prev_bal = current_bal
                 delta_plus_bet = delta + current_bet  # Δ Bal+Bet = 실질 수익
 
+                # "이전" 스핀의 행 번호를 찾아 Duration 업데이트
+                if row > 0:
+                    for prev_row in range(row - 1, -1, -1):
+                        prev_spin_item = self.table.item(prev_row, 0)
+                        if prev_spin_item and prev_spin_item.text().strip():
+                            try:
+                                p_time = self.table.item(prev_row, 1).text()
+                                c_time = row_data[1]  # current time
+                                p_parts = p_time.split(':')
+                                c_parts = c_time.split(':')
+                                p_sec = int(p_parts[0])*3600 + int(p_parts[1])*60 + int(p_parts[2])
+                                c_sec = int(c_parts[0])*3600 + int(c_parts[1])*60 + int(c_parts[2])
+                                e_sec = c_sec - p_sec
+                                if e_sec < 0: e_sec = 0
+                                dur_str = f"{e_sec // 60:02d}:{e_sec % 60:02d}"
+                                dur_item = self.table.item(prev_row, 2)
+                                if dur_item: dur_item.setText(dur_str)
+                                # data_rows가 있다면 업데이트
+                                if len(self.data_rows) > prev_row and len(self.data_rows[prev_row]) > 2:
+                                    self.data_rows[prev_row][2] = dur_str
+                            except Exception:
+                                pass
+                            break
+
                 # Update Delta Balance UI
-                delta_item = self.table.item(row, 5)
+                delta_item = self.table.item(row, 6)
                 if delta_item:
                     delta_item.setText(f"{delta:+,.0f}")
                     if delta > 0: delta_item.setForeground(Qt.green)
@@ -1239,15 +1263,14 @@ class MainWindow(QMainWindow):
 
                 # Δ Bal+Bet → 이전 스핀 행에 기록
                 # 현재 행의 Bal+Bet 셀은 비움
-                dbp_item = self.table.item(row, 6)
+                dbp_item = self.table.item(row, 7)
                 if dbp_item:
                     dbp_item.setText("")
                 if row > 0:
                     for prev_row in range(row - 1, -1, -1):
                         prev_spin_item = self.table.item(prev_row, 0)
-                        prev_evt_item = self.table.item(prev_row, 7)
-                        if prev_spin_item and prev_spin_item.text().strip() and not (prev_evt_item and prev_evt_item.text().strip()):
-                            prev_dbp = self.table.item(prev_row, 6)
+                        if prev_spin_item and prev_spin_item.text().strip():
+                            prev_dbp = self.table.item(prev_row, 7)
                             if prev_dbp:
                                 prev_dbp.setText(f"{delta_plus_bet:+,.0f}")
                                 if delta_plus_bet > 0: prev_dbp.setForeground(Qt.green)
@@ -1255,7 +1278,7 @@ class MainWindow(QMainWindow):
                                 else: prev_dbp.setForeground(Qt.gray)
                             break
 
-            # data_rows: [Spin#, Time, Bet, Balance, Win, Delta, DeltaPlusBet, EventType]
+            # data_rows: [Spin#, Time, Duration, Bet, Balance, Win, Delta, DeltaPlusBet, EventType]
             row_data.append(delta)
             row_data.append(delta_plus_bet)
             row_data.append(event_type)
@@ -1279,17 +1302,18 @@ class MainWindow(QMainWindow):
         self.table.insertRow(insert_pos)
         self.table.setItem(insert_pos, 0, QTableWidgetItem("0"))
         self.table.setItem(insert_pos, 1, QTableWidgetItem("00:00:00"))
-        self.table.setItem(insert_pos, 2, QTableWidgetItem("0"))
+        self.table.setItem(insert_pos, 2, QTableWidgetItem(""))
         self.table.setItem(insert_pos, 3, QTableWidgetItem("0"))
         self.table.setItem(insert_pos, 4, QTableWidgetItem("0"))
-        self.table.setItem(insert_pos, 5, QTableWidgetItem("+0"))
+        self.table.setItem(insert_pos, 5, QTableWidgetItem("0"))
         self.table.setItem(insert_pos, 6, QTableWidgetItem("+0"))
-        self.table.setItem(insert_pos, 7, QTableWidgetItem(""))
+        self.table.setItem(insert_pos, 7, QTableWidgetItem("+0"))
+        self.table.setItem(insert_pos, 8, QTableWidgetItem(""))
 
         btn = QPushButton("Go")
         btn.setObjectName("btnSmall")
         btn.clicked.connect(lambda checked, ts="00:00:00": self.player.seek_to_time(ts))
-        self.table.setCellWidget(insert_pos, 8, btn)
+        self.table.setCellWidget(insert_pos, 9, btn)
 
         self._renumber_spins()
         self.table.blockSignals(False)
@@ -1309,15 +1333,14 @@ class MainWindow(QMainWindow):
         self.sync_data_from_table()
 
     def _renumber_spins(self):
-        """모든 행의 Spin 번호를 1부터 순서대로 재설정. Event 행(Event Type이 있는 행)은 건너뜀."""
+        """모든 행의 Spin 번호를 1부터 순서대로 재설정. Event 전용 행(Spin이 기존에 없던 행)은 건너뜀."""
         spin_num = 0
         for row in range(self.table.rowCount()):
-            # Event Type 열 (column 7) 에 값이 있으면 이벤트 전용 행 → Spin 공란 유지
-            evt_item = self.table.item(row, 7)
-            if evt_item and evt_item.text().strip():
-                item = self.table.item(row, 0)
-                if item:
-                    item.setText("")
+            # Spin # 열 (column 0) 이 비어있다면 이벤트 전용 행으로 간주
+            spin_item = self.table.item(row, 0)
+            if not spin_item or not spin_item.text().strip():
+                if spin_item:
+                    spin_item.setText("")
                 else:
                     self.table.setItem(row, 0, QTableWidgetItem(""))
             else:
@@ -1407,9 +1430,8 @@ class MainWindow(QMainWindow):
                         
                         # Find the previous spin row to update its Duration (column 2)
                         for prev_row in range(row - 1, -1, -1):
-                            prev_evt = self.table.item(prev_row, 8)
                             prev_spin = self.table.item(prev_row, 0)
-                            if prev_spin and prev_spin.text().strip() and not (prev_evt and prev_evt.text().strip()):
+                            if prev_spin and prev_spin.text().strip():
                                 self.table.setItem(prev_row, 2, QTableWidgetItem(duration_str))
                                 self.data_rows[prev_row][2] = duration_str
                                 break
@@ -1448,11 +1470,9 @@ class MainWindow(QMainWindow):
             if dbp_str and row > 0:
                 # 이전 스핀 행 찾기 (이벤트 전용 행 건너뛰기)
                 for prev_row in range(row - 1, -1, -1):
-                    # Event Type is now column 8
-                    prev_evt = self.table.item(prev_row, 8)
                     prev_spin = self.table.item(prev_row, 0)
                     # 이벤트 전용 행이 아닌 일반 스핀 행 찾기
-                    if prev_spin and prev_spin.text().strip() and not (prev_evt and prev_evt.text().strip()):
+                    if prev_spin and prev_spin.text().strip():
                         dbp_item = QTableWidgetItem(dbp_str)
                         if dbp > 0:
                             dbp_item.setForeground(Qt.green)
@@ -1672,20 +1692,37 @@ class MainWindow(QMainWindow):
             self.table.blockSignals(True)
             self.table.setRowCount(0)
             self.data_rows = []
-            self.prev_balance = None
+            self.prev_spin_sec = None
 
             for _, row in df.iterrows():
                 # Skip total time row if exists
-                if pd.isna(row["Spin #"]) or row["Spin #"] == "":
+                if "Total Time" in str(row.values) or "Total Time:" in str(row.values):
                     continue
 
-                spin = int(row["Spin #"])
-                time_str = str(row["Time"])
-                bet = float(str(row["Bet"]).replace(',', ''))
-                balance = float(str(row["Balance"]).replace(',', ''))
-                win = float(str(row["Win"]).replace(',', ''))
+                spin_val = row.get("Spin #", "")
+                if pd.isna(spin_val) or str(spin_val).strip() == "":
+                    spin = -1
+                else:
+                    try:
+                        spin = int(spin_val)
+                    except ValueError:
+                        spin = -1
 
-                self.add_row(spin, time_str, bet, win, balance)
+                time_str = str(row.get("Time", ""))
+                if time_str == "nan": time_str = ""
+                
+                def safe_float(val):
+                    if pd.isna(val) or str(val).strip() == "" or str(val).strip() == "nan": return 0.0
+                    try: return float(str(val).replace(',', ''))
+                    except ValueError: return 0.0
+
+                bet = safe_float(row.get("Bet"))
+                balance = safe_float(row.get("Balance"))
+                win = safe_float(row.get("Win"))
+                event_type = str(row.get("Event Type", ""))
+                if event_type == "nan": event_type = ""
+
+                self.add_row(spin, time_str, bet, win, balance, event_type)
 
             self.table.blockSignals(False)
             self.sync_data_from_table()
@@ -1774,69 +1811,69 @@ class MainWindow(QMainWindow):
 
             for r in rows:
                 if len(r) >= 5:
-                    spin = int(r[0])
+                    spin_val = r[0]
+                    spin = int(spin_val) if spin_val != "" else -1
                     time_str = str(r[1])
-                    bet = float(r[2])
-                    # 새 data_rows 구조: [Spin, Time, Bet, Balance, Win, ...]
-                    # 기존 구버전 호환: [Spin, Time, Bet, Win, Balance, ...] 가능
-                    if len(r) >= 8:
-                        # 새 구조 (8개 요소)
-                        bal = float(r[3])
-                        win = float(r[4])
+                    elapsed_str = ""
+
+                    if len(r) >= 9:
+                        # 새 구조 (9개 요소)
+                        elapsed_str = str(r[2])
+                        bet = float(r[3]) if r[3] != "" else 0.0
+                        bal = float(r[4]) if r[4] != "" else 0.0
+                        win = float(r[5]) if r[5] != "" else 0.0
+                        event_type = str(r[8]) if len(r) > 8 else ""
+                    elif len(r) == 8:
+                        # 과도기 구조 (8개 요소)
+                        bet = float(r[2]) if r[2] != "" else 0.0
+                        bal = float(r[3]) if r[3] != "" else 0.0
+                        win = float(r[4]) if r[4] != "" else 0.0
                         event_type = str(r[7]) if len(r) > 7 else ""
                     else:
-                        # 기존 구조 (7개 요소, win/balance 순서 뒤바뀜)
-                        win = float(r[3])
-                        bal = float(r[4])
+                        # 기존 레거시 구조 (7개 요소, win/balance 뒤바뀜)
+                        bet = float(r[2]) if r[2] != "" else 0.0
+                        win = float(r[3]) if r[3] != "" else 0.0
+                        bal = float(r[4]) if r[4] != "" else 0.0
                         event_type = str(r[6]) if len(r) > 6 else ""
 
-                    delta = bal - self.prev_balance if self.prev_balance is not None else 0.0
-                    self.prev_balance = bal
-                    delta_str = f"{delta:+,.2f}"
-                    dbp = delta + bet
-                    dbp_str = f"{dbp:+,.2f}"
-
+                    is_evt = (spin == -1)
                     row_idx = self.table.rowCount()
                     self.table.insertRow(row_idx)
-                    self.table.setItem(row_idx, 0, QTableWidgetItem(str(spin)))
-                    self.table.setItem(row_idx, 1, QTableWidgetItem(time_str))
-                    self.table.setItem(row_idx, 2, QTableWidgetItem(f"{bet:,.2f}"))
-                    self.table.setItem(row_idx, 3, QTableWidgetItem(f"{bal:,.2f}"))
-                    self.table.setItem(row_idx, 4, QTableWidgetItem(f"{win:,.2f}"))
 
-                    delta_item = QTableWidgetItem(delta_str)
-                    if delta > 0: delta_item.setForeground(Qt.green)
-                    elif delta < 0: delta_item.setForeground(Qt.red)
-                    self.table.setItem(row_idx, 5, delta_item)
-
-                    # Δ Bal+Bet → 이전 스핀 행에 기록 (현재 행은 빈 셀)
-                    self.table.setItem(row_idx, 6, QTableWidgetItem(""))
-                    if row_idx > 0:
-                        for prev_row in range(row_idx - 1, -1, -1):
-                            prev_spin_item = self.table.item(prev_row, 0)
-                            prev_evt_item = self.table.item(prev_row, 7)
-                            if prev_spin_item and prev_spin_item.text().strip() and not (prev_evt_item and prev_evt_item.text().strip()):
-                                dbp_item = QTableWidgetItem(dbp_str)
-                                if dbp > 0: dbp_item.setForeground(Qt.green)
-                                elif dbp < 0: dbp_item.setForeground(Qt.red)
-                                self.table.setItem(prev_row, 6, dbp_item)
-                                break
+                    if is_evt:
+                        self.table.setItem(row_idx, 0, QTableWidgetItem(""))
+                        self.table.setItem(row_idx, 1, QTableWidgetItem(time_str))
+                        self.table.setItem(row_idx, 2, QTableWidgetItem(elapsed_str))
+                        self.table.setItem(row_idx, 3, QTableWidgetItem(""))
+                        self.table.setItem(row_idx, 4, QTableWidgetItem(""))
+                        self.table.setItem(row_idx, 5, QTableWidgetItem(""))
+                        self.table.setItem(row_idx, 6, QTableWidgetItem(""))
+                        self.table.setItem(row_idx, 7, QTableWidgetItem(""))
+                    else:
+                        self.table.setItem(row_idx, 0, QTableWidgetItem(str(spin)))
+                        self.table.setItem(row_idx, 1, QTableWidgetItem(time_str))
+                        self.table.setItem(row_idx, 2, QTableWidgetItem(elapsed_str))
+                        self.table.setItem(row_idx, 3, QTableWidgetItem(f"{bet:,.0f}"))
+                        self.table.setItem(row_idx, 4, QTableWidgetItem(f"{bal:,.0f}"))
+                        self.table.setItem(row_idx, 5, QTableWidgetItem(f"{win:,.0f}"))
+                        self.table.setItem(row_idx, 6, QTableWidgetItem(""))
+                        self.table.setItem(row_idx, 7, QTableWidgetItem(""))
 
                     event_item = QTableWidgetItem(event_type)
                     if event_type:
                         event_item.setForeground(Qt.yellow)
-                    self.table.setItem(row_idx, 7, event_item)
+                    self.table.setItem(row_idx, 8, event_item)
 
                     btn = QPushButton("Go")
                     btn.setObjectName("btnSmall")
                     btn.clicked.connect(lambda checked, ts=time_str: self.player.seek_to_time(ts))
-                    self.table.setCellWidget(row_idx, 8, btn)
-
-                    self.data_rows.append([spin, time_str, bet, bal, win, delta, dbp, event_type])
+                    self.table.setCellWidget(row_idx, 9, btn)
 
             self.table.setUpdatesEnabled(True)  # 화면 갱신 재개
             self.table.blockSignals(False)
-            self.graph_tab.set_data(self.data_rows)
+            
+            # 동기화하면서 Duration, Delta 등이 옛날 포맷에서 로드된 것까지 완벽하게 재계산됨.
+            self.sync_data_from_table()
 
             if self.table.rowCount() > 0:
                 self.btn_export.setEnabled(True)
