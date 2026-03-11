@@ -985,37 +985,84 @@ class MainWindow(QMainWindow):
         frame = selected_frame[0]
         cap.release()
 
-        # ── cv2 ROI 선택 (선택된 프레임 사용) ──
-        # 화면에 맞게 리사이즈 (최대 1280px 폭)
-        orig_h, orig_w = frame.shape[:2]
-        max_display_w = 1280
-        if orig_w > max_display_w:
-            scale = max_display_w / orig_w
-            display_frame = cv2.resize(frame, (int(orig_w * scale), int(orig_h * scale)))
-        else:
+        # ── 2단계 줌(확대) ROI 선택 헬퍼 함수 ──
+        def select_roi_with_zoom(frame, window_title="ROI Selection", use_zoom=True) -> tuple[int, int, int, int] | None:
+            h, w = frame.shape[:2]
+            max_h = 750 
             scale = 1.0
-            display_frame = frame.copy()
+            
+            if h > max_h:
+                scale = max_h / h
+                f_display = cv2.resize(frame, (int(w * scale), int(h * scale)))
+                
+                r1 = cv2.selectROI(f"{window_title} - Step 1", f_display, False)
+                cv2.destroyWindow(f"{window_title} - Step 1")
+                if r1[2] <= 0: return None
+                # 원본 좌표로 역산
+                r1 = (int(r1[0] / scale), int(r1[1] / scale), int(r1[2] / scale), int(r1[3] / scale))
+            else:
+                r1 = cv2.selectROI(f"{window_title} - Step 1", frame, False)
+                cv2.destroyWindow(f"{window_title} - Step 1")
+                if r1[2] <= 0: return None
 
-        cv2.putText(display_frame, "1. Drag [BALANCE] region -> press ENTER", (20, 40),
-                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-        roi_bal_scaled = cv2.selectROI("Select BALANCE Region", display_frame, True, False)
-        cv2.destroyWindow("Select BALANCE Region")
+            x1, y1, w1, h1 = r1
+            if not use_zoom:
+                return (x1, y1, w1, h1)
 
-        if roi_bal_scaled == (0,0,0,0) or roi_bal_scaled[2]==0 or roi_bal_scaled[3]==0:
+            # 2단계: 선택 영역을 5배 확대하여 정밀 선택
+            x1, y1, w1, h1 = r1
+            roi_crop = frame[y1:y1 + h1, x1:x1 + w1]
+            if roi_crop.size == 0: return None
+            
+            # 5배 확대 (Lanczos4 보간법 사용으로 계단현상 방지)
+            zoom_img = cv2.resize(roi_crop, None, fx=5, fy=5, interpolation=cv2.INTER_LANCZOS4)
+            
+            # CLAHE 적용을 통한 빛 번짐 개선 및 국소 대비 향상
+            lab = cv2.cvtColor(zoom_img, cv2.COLOR_BGR2LAB)
+            l_channel, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            cl = clahe.apply(l_channel)
+            limg = cv2.merge((cl, a, b))
+            zoom_img = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+            
+            # 약한 Sharpening(언샤프 마스킹)으로 경계선 뚜렷하게
+            kernel = np.array([[0, -1, 0],
+                               [-1, 5, -1],
+                               [0, -1, 0]])
+            zoom_img = cv2.filter2D(zoom_img, -1, kernel)
+                         
+            r2 = cv2.selectROI(f"{window_title} - Zoom (5x)", zoom_img, False)
+            cv2.destroyWindow(f"{window_title} - Zoom (5x)")
+            
+            if r2[2] <= 0: return None
+            
+            # 최종 좌표 계산 (원본 프레임 기준)
+            final_x = x1 + int(r2[0] / 5)
+            final_y = y1 + int(r2[1] / 5)
+            final_w = int(r2[2] / 5)
+            final_h = int(r2[3] / 5)
+            
+            return (final_x, final_y, final_w, final_h)
+
+        # ── cv2 ROI 선택 (선택된 프레임 사용) ──
+        roi_bal = select_roi_with_zoom(frame, "Select BALANCE Region")
+        if not roi_bal:
             self.lbl_status.setText("ROI cancelled.")
             return
 
-        # 원본 해상도로 좌표 역변환
-        roi_bal = tuple(int(v / scale) for v in roi_bal_scaled)
-
-        x, y, w, h = roi_bal_scaled
-        cv2.rectangle(display_frame, (x,y), (x+w, y+h), (0,0,255), 2)
-        cv2.putText(display_frame, "2. Drag [WIN] region -> press ENTER (or ESC to skip)", (20, 120),
-                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        roi_win_scaled = cv2.selectROI("Select WIN Region", display_frame, True, False)
-        cv2.destroyAllWindows()
-
         self.roi_bal = roi_bal
+
+        roi_win = select_roi_with_zoom(frame, "Select WIN Region (or ESC to skip)", use_zoom=True)
+        if not roi_win:
+            self.roi_win = None
+        else:
+            self.roi_win = roi_win
+            
+        roi_event = select_roi_with_zoom(frame, "Select EVENT Region (or ESC to skip)", use_zoom=False)
+        if not roi_event:
+            self.roi_event = None
+        else:
+            self.roi_event = roi_event
 
         # ── Balance ROI 필터 튜닝 다이얼로그 ──
         bx, by, bw, bh = roi_bal
@@ -1026,13 +1073,11 @@ class MainWindow(QMainWindow):
         else:
             self.roi_bal_filter = None
 
-        if roi_win_scaled == (0,0,0,0) or roi_win_scaled[2]==0 or roi_win_scaled[3]==0:
-            self.roi_win = None
+        if self.roi_win is None:
             self.roi_win_filter = None
             self.btn_start.setEnabled(True)
-            self.lbl_status.setText("ROI set ✓ (Balance only) → Press Start")
+            self.lbl_status.setText(f"ROI set ✓ (Balance{', Event' if self.roi_event else ''}) → Press Start")
         else:
-            self.roi_win = tuple(int(v / scale) for v in roi_win_scaled)
             # ── Win ROI 필터 튜닝 다이얼로그 ──
             wx2, wy2, ww2, wh2 = self.roi_win
             win_crop_gray = cv2.cvtColor(frame[wy2:wy2+wh2, wx2:wx2+ww2], cv2.COLOR_BGR2GRAY)
@@ -1042,26 +1087,7 @@ class MainWindow(QMainWindow):
             else:
                 self.roi_win_filter = None
             self.btn_start.setEnabled(True)
-            self.lbl_status.setText("ROI set ✓ → Press Start")
-
-        # 3단계: Event ROI 선택 (선택 사항)
-        display_frame3 = display_frame.copy()
-        # 기존 ROI 표시
-        bx, by, bw, bh = roi_bal_scaled
-        cv2.rectangle(display_frame3, (bx, by), (bx+bw, by+bh), (0, 0, 255), 2)
-        if roi_win_scaled != (0,0,0,0) and roi_win_scaled[2] > 0:
-            wx, wy, ww, wh = roi_win_scaled
-            cv2.rectangle(display_frame3, (wx, wy), (wx+ww, wy+wh), (0, 255, 0), 2)
-        cv2.putText(display_frame3, "3. Drag [EVENT] region -> press ENTER (or ESC to skip)", (20, 80),
-                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
-        roi_event_scaled = cv2.selectROI("Select EVENT Region", display_frame3, True, False)
-        cv2.destroyAllWindows()
-
-        if roi_event_scaled == (0,0,0,0) or roi_event_scaled[2] == 0 or roi_event_scaled[3] == 0:
-            self.roi_event = None
-        else:
-            self.roi_event = tuple(int(v / scale) for v in roi_event_scaled)
-            self.lbl_status.setText("ROI set ✓ (+ Event) → Press Start")
+            self.lbl_status.setText(f"ROI set ✓ (Bal, Win{', Event' if self.roi_event else ''}) → Press Start")
 
         # VideoPlayer에 ROI 전달 및 EasyOCR lazy-init
         self.player._ocr_roi_bal = self.roi_bal
