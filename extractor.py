@@ -497,8 +497,31 @@ class LogicProcessor:
 
             # 1. 이상값 필터 (bal_filter)
             if raw_bal is not None and self.current_bal is not None and self.bal_filter is not None:
-                if abs(raw_bal - self.current_bal) >= self.bal_filter:
-                    raw_bal = None
+                threshold = self.bal_filter
+                if self.fixed_bet is not None:
+                    threshold = self.bal_filter * self.fixed_bet
+                    
+                bal_diff = raw_bal - self.current_bal
+                if abs(bal_diff) >= threshold:
+                    # "Error" 스핀 강제 방출
+                    h_m_s = f"{int(time_sec//3600):02d}:{int((time_sec%3600)//60):02d}:{int(time_sec%60):02d}"
+                    err_msg = "Error"
+                    if clip_event:
+                        err_msg += f", {clip_event}"
+                        
+                    self.spin_count += 1
+                    bet_amount = self.fixed_bet if self.fixed_bet is not None else 0.0
+                    self.last_bet = bet_amount
+                    
+                    self.data_signal.emit(self.spin_count, h_m_s, bet_amount, 0.0, float(raw_bal), err_msg)
+                    
+                    # 에러 스핀 발생 시 현재 잔액을 에러 난 자금(raw_bal)으로 갱신해 다음 연산이 이어지게 함
+                    self.current_bal = float(raw_bal)
+                    self.current_win = 0.0
+                    self.last_stable_bal = float(raw_bal)
+                    self.spin_base_bal = float(raw_bal)
+                    
+                    raw_bal = None  # 기존 정상 흐름은 타지 않게 None 처리
 
             # 필터에 걸러졌거나 OCR이 실패한 경우 즉시 카운터 초기화
             if raw_bal is None:

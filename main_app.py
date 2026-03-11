@@ -10,9 +10,9 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QProgressBar, QTableWidget, QTableWidgetItem, QMessageBox,
                              QHeaderView, QSplitter, QTabWidget, QComboBox, QSizePolicy,
                              QLineEdit, QSlider, QStyle, QDialog, QDoubleSpinBox,
-                             QCheckBox, QSpinBox, QGroupBox)
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QImage, QPixmap, QFont, QIcon
+                             QCheckBox, QSpinBox, QGroupBox, QToolTip)
+from PyQt5.QtCore import Qt, QTimer, QObject, QEvent
+from PyQt5.QtGui import QImage, QPixmap, QFont, QIcon, QCursor, QColor
 import json
 import time
 
@@ -21,6 +21,20 @@ import matplotlib
 matplotlib.use('Qt5Agg')
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from matplotlib.figure import Figure
+
+class FastTooltipFilter(QObject):
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Enter:
+            if hasattr(obj, 'toolTip') and obj.toolTip():
+                def show_tooltip():
+                    try:
+                        if obj.underMouse():
+                            QToolTip.showText(QCursor.pos(), obj.toolTip(), obj)
+                    except Exception:
+                        pass
+                QTimer.singleShot(250, show_tooltip)
+        return super().eventFilter(obj, event)
 
 # ── Dark Theme Stylesheet ───────────────────────────────────────────
 DARK_STYLE = """
@@ -80,6 +94,10 @@ QSlider::handle:horizontal {
 }
 QSlider::sub-page:horizontal { background: #00d4aa; border-radius: 3px; }
 QSplitter::handle { background-color: #16213e; width: 3px; }
+QCheckBox { spacing: 6px; }
+QCheckBox::indicator { width: 16px; height: 16px; border: 2px solid #555; background: #2a2a4a; border-radius: 3px; }
+QCheckBox::indicator:hover { border: 2px solid #00d4aa; }
+QCheckBox::indicator:checked { background: #00d4aa; border: 2px solid #00d4aa; image: url(check.png); }
 """
 
 
@@ -323,12 +341,15 @@ class VideoPlayer(QWidget):
         self.btn_step_fwd.clicked.connect(self.step_forward)
 
         # 프레임/초 단위 전환 토글
-        self.step_mode = "frame"  # "frame" or "second"
-        self.btn_step_mode = QPushButton("F")
+        self.step_mode = "second"  # default to 'second'
+        self.btn_step_mode = QPushButton("S")
         self.btn_step_mode.setFixedSize(28, 24)
-        self.btn_step_mode.setStyleSheet("font-size: 10px; font-weight: bold; padding: 0px; color: #00d4aa;")
-        self.btn_step_mode.setToolTip("Step Mode: Frame (click to toggle)")
+        self.btn_step_mode.setStyleSheet("font-size: 10px; font-weight: bold; padding: 0px; color: #ffb347;")
+        self.btn_step_mode.setToolTip("Step Mode: Second (click to toggle)")
         self.btn_step_mode.clicked.connect(self._toggle_step_mode)
+        
+        self.btn_step_back.setToolTip("1 Second Back")
+        self.btn_step_fwd.setToolTip("1 Second Forward")
 
         ctrl_layout.addWidget(self.btn_play)
         ctrl_layout.addWidget(self.btn_step_back)
@@ -740,9 +761,20 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.spin_stability)
 
         # Drop Only Spin 옵션
-        self.chk_drop_only = QCheckBox("Drop Only")
+        lbl_drop_only = QLabel("Drop Only:")
+        self.chk_drop_only = QCheckBox()
         self.chk_drop_only.setToolTip("ON: Balance 하락 시에만 스핀 카운트 (롤업 안착은 baseline 갱신만)")
+        toolbar.addWidget(lbl_drop_only)
         toolbar.addWidget(self.chk_drop_only)
+        
+        # 상단 입력 UI 빠른 툴팁 적용
+        self.fast_tooltip = FastTooltipFilter(self)
+        self.txt_start_time.installEventFilter(self.fast_tooltip)
+        self.spin_clip_th.installEventFilter(self.fast_tooltip)
+        self.txt_bal_filter.installEventFilter(self.fast_tooltip)
+        self.txt_fixed_bet.installEventFilter(self.fast_tooltip)
+        self.spin_stability.installEventFilter(self.fast_tooltip)
+        self.chk_drop_only.installEventFilter(self.fast_tooltip)
 
         toolbar.addWidget(self.lbl_file, 1)
         root_layout.addLayout(toolbar)
@@ -1152,6 +1184,15 @@ class MainWindow(QMainWindow):
         except ValueError:
             fixed_bet_val = None
 
+        if bal_filter_val is not None:
+            if fixed_bet_val is None or fixed_bet_val <= 0:
+                QMessageBox.warning(self, "Warning", "Balance Filter를 사용하려면 반드시 Fixed Bet(고정 배팅금액)을 입력해야 합니다.")
+                self.btn_select.setEnabled(True)
+                self.btn_roi.setEnabled(True)
+                self.btn_start.setEnabled(True)
+                self.btn_stop.setEnabled(False)
+                return
+
         self.extractor_thread = ExtractorThread(
             self.video_path, self.roi_bal, self.roi_win, self.roi_event, start_frame,
             clip_threshold=self.spin_clip_th.value(),
@@ -1224,6 +1265,18 @@ class MainWindow(QMainWindow):
             # Event Type 행과 무관하게 Spin#가 존재하면 스핀 행으로 취급
             evt_item = self.table.item(row, 8)
             event_type = evt_item.text().strip() if evt_item else ""
+            if evt_item:
+                if "Error" in event_type:
+                    evt_item.setForeground(QColor("#ff6b6b"))
+                    font = evt_item.font()
+                    font.setBold(True)
+                    evt_item.setFont(font)
+                elif event_type:
+                    evt_item.setForeground(Qt.yellow)
+                    font = evt_item.font()
+                    font.setBold(False)
+                    evt_item.setFont(font)
+                    
             spin_item = self.table.item(row, 0)
             spin_text = spin_item.text().strip() if spin_item else ""
             is_event_row = not bool(spin_text)
@@ -1510,7 +1563,13 @@ class MainWindow(QMainWindow):
         # Event Type cell with highlight (column 8)
         event_item = QTableWidgetItem(event_type if event_type else "")
         if event_type:
-            event_item.setForeground(Qt.yellow)
+            if "Error" in event_type:
+                event_item.setForeground(QColor("#ff6b6b"))
+                font = event_item.font()
+                font.setBold(True)
+                event_item.setFont(font)
+            else:
+                event_item.setForeground(Qt.yellow)
         self.table.setItem(row, 8, event_item)
 
         # "Go" button to jump video to this time (column 9)
