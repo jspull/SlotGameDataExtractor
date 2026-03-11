@@ -1114,6 +1114,8 @@ class MainWindow(QMainWindow):
         try:
             bf_str = self.txt_bal_filter.text().replace(',', '').strip()
             bal_filter_val = float(bf_str) if bf_str else None
+            if bal_filter_val == 0.0:
+                bal_filter_val = None
         except ValueError:
             bal_filter_val = None
 
