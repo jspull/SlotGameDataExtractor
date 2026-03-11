@@ -777,10 +777,10 @@ class MainWindow(QMainWindow):
         dt_layout = QVBoxLayout(data_tab)
         dt_layout.setContentsMargins(0, 0, 0, 0)
         self.table = QTableWidget()
-        self.table.setColumnCount(9)
-        self.table.setHorizontalHeaderLabels(["Spin #", "Time", "Bet", "Balance", "Win", "Δ Balance", "Δ Bal+Bet", "Event Type", ""])
+        self.table.setColumnCount(10)
+        self.table.setHorizontalHeaderLabels(["Spin #", "Time", "Duration", "Bet", "Balance", "Win", "Δ Balance", "Δ Bal+Bet", "Event Type", ""])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeToContents)
         self.table.setAlternatingRowColors(True)
         self.table.itemChanged.connect(self.on_item_changed)
         dt_layout.addWidget(self.table)
@@ -1391,6 +1391,29 @@ class MainWindow(QMainWindow):
 
         row = self.table.rowCount()
         self.table.insertRow(row)
+
+        # Calculate Duration (elapsed time to next spin) and update the previous spin row
+        if time_str:
+            try:
+                parts = time_str.split(':')
+                current_sec = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                if spin != -1:
+                    if hasattr(self, 'prev_spin_sec') and self.prev_spin_sec is not None:
+                        e_sec = current_sec - self.prev_spin_sec
+                        if e_sec < 0: e_sec = 0
+                        duration_str = f"{e_sec // 60:02d}:{e_sec % 60:02d}"
+                        
+                        # Find the previous spin row to update its Duration (column 2)
+                        for prev_row in range(row - 1, -1, -1):
+                            prev_evt = self.table.item(prev_row, 8)
+                            prev_spin = self.table.item(prev_row, 0)
+                            if prev_spin and prev_spin.text().strip() and not (prev_evt and prev_evt.text().strip()):
+                                self.table.setItem(prev_row, 2, QTableWidgetItem(duration_str))
+                                self.data_rows[prev_row][2] = duration_str
+                                break
+                    self.prev_spin_sec = current_sec
+            except Exception:
+                pass
         
         if is_event_only:
             self.table.setItem(row, 0, QTableWidgetItem(""))
@@ -1400,12 +1423,14 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, 4, QTableWidgetItem(""))
             self.table.setItem(row, 5, QTableWidgetItem(""))
             self.table.setItem(row, 6, QTableWidgetItem(""))
+            self.table.setItem(row, 7, QTableWidgetItem(""))
         else:
             self.table.setItem(row, 0, QTableWidgetItem(str(spin)))
             self.table.setItem(row, 1, QTableWidgetItem(time_str))
-            self.table.setItem(row, 2, QTableWidgetItem(f"{bet:,.0f}"))
-            self.table.setItem(row, 3, QTableWidgetItem(f"{balance:,.0f}"))
-            self.table.setItem(row, 4, QTableWidgetItem(f"{win:,.0f}"))
+            self.table.setItem(row, 2, QTableWidgetItem(""))
+            self.table.setItem(row, 3, QTableWidgetItem(f"{bet:,.0f}"))
+            self.table.setItem(row, 4, QTableWidgetItem(f"{balance:,.0f}"))
+            self.table.setItem(row, 5, QTableWidgetItem(f"{win:,.0f}"))
 
             # Δ Balance cell with color
             delta_item = QTableWidgetItem(delta_str)
@@ -1413,15 +1438,16 @@ class MainWindow(QMainWindow):
                 delta_item.setForeground(Qt.green)
             elif delta < 0:
                 delta_item.setForeground(Qt.red)
-            self.table.setItem(row, 5, delta_item)
+            self.table.setItem(row, 6, delta_item)
 
             # Δ Bal+Bet → 이전 스핀 행에 기록 (현재 스핀이 아니라 이전 스핀의 "결과 수익")
             # 현재 행은 빈 셀로 유지
-            self.table.setItem(row, 6, QTableWidgetItem(""))
+            self.table.setItem(row, 7, QTableWidgetItem(""))
             if dbp_str and row > 0:
                 # 이전 스핀 행 찾기 (이벤트 전용 행 건너뛰기)
                 for prev_row in range(row - 1, -1, -1):
-                    prev_evt = self.table.item(prev_row, 7)
+                    # Event Type is now column 8
+                    prev_evt = self.table.item(prev_row, 8)
                     prev_spin = self.table.item(prev_row, 0)
                     # 이벤트 전용 행이 아닌 일반 스핀 행 찾기
                     if prev_spin and prev_spin.text().strip() and not (prev_evt and prev_evt.text().strip()):
@@ -1430,27 +1456,27 @@ class MainWindow(QMainWindow):
                             dbp_item.setForeground(Qt.green)
                         elif dbp < 0:
                             dbp_item.setForeground(Qt.red)
-                        self.table.setItem(prev_row, 6, dbp_item)
+                        self.table.setItem(prev_row, 7, dbp_item)
                         break
 
-        # Event Type cell with highlight (column 7)
+        # Event Type cell with highlight (column 8)
         event_item = QTableWidgetItem(event_type if event_type else "")
         if event_type:
             event_item.setForeground(Qt.yellow)
-        self.table.setItem(row, 7, event_item)
+        self.table.setItem(row, 8, event_item)
 
-        # "Go" button to jump video to this time (column 8)
+        # "Go" button to jump video to this time (column 9)
         btn = QPushButton("Go")
         btn.setObjectName("btnSmall")
         btn.clicked.connect(lambda checked, ts=time_str: self.player.seek_to_time(ts))
-        self.table.setCellWidget(row, 8, btn)
+        self.table.setCellWidget(row, 9, btn)
 
         # Only auto-scroll if user was already at the bottom
         if at_bottom:
             self.table.scrollToBottom()
 
-        # data_rows: [Spin#, Time, Bet, Balance, Win, Delta, DeltaPlusBet, EventType]
-        self.data_rows.append([spin if not is_event_only else "", time_str, 
+        # data_rows: [Spin#, Time, Duration, Bet, Balance, Win, Delta, DeltaPlusBet, EventType]
+        self.data_rows.append([spin if not is_event_only else "", time_str, "",
                                bet if not is_event_only else "", 
                                balance if not is_event_only else "", 
                                win if not is_event_only else "", 
@@ -1463,14 +1489,14 @@ class MainWindow(QMainWindow):
         """저장된 테이블 데이터 중 현재 시간과 1.5초 이내에 발생한 이벤트 문구를 반환합니다."""
         event_texts = []
         for r in self.data_rows:
-            if len(r) > 7 and r[7]:  # event_type 존재 (index 7)
+            if len(r) > 8 and r[8]:  # event_type 존재 (index 8)
                 parts = str(r[1]).split(':')
                 if len(parts) == 3:
                     try:
                         event_sec = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
                         if abs(event_sec - frame_time_sec) <= 1.5:
-                            if r[7] not in event_texts:
-                                event_texts.append(r[7])
+                            if r[8] not in event_texts:
+                                event_texts.append(r[8])
                     except ValueError:
                         pass
         return " / ".join(event_texts) if event_texts else ""
@@ -1558,6 +1584,7 @@ class MainWindow(QMainWindow):
         self.roi_win_filter = None
         self.elapsed_time = ""
         self.prev_balance = None
+        self.prev_spin_sec = None
         self.lbl_file.setText("No file selected")
         self.lbl_status.setText("Ready")
         self.txt_start_time.reset()  # ★ 시작시간도 리셋
@@ -1577,7 +1604,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Save Excel", "slot_extracted_data.xlsx", "Excel Files (*.xlsx)")
         if not path:
             return
-        headers = ["Spin #", "Time", "Bet", "Balance", "Win", "Δ Balance", "Δ Bal+Bet", "Event Type"]
+        headers = ["Spin #", "Time", "Duration", "Bet", "Balance", "Win", "Δ Balance", "Δ Bal+Bet", "Event Type"]
 
         rows = []
         for i, r in enumerate(self.data_rows):
@@ -1586,37 +1613,39 @@ class MainWindow(QMainWindow):
             except (ValueError, TypeError):
                 spin_val = str(r[0]) if r[0] else ""
             time_val = str(r[1]) if len(r) > 1 else ""
-            event = str(r[7]) if len(r) > 7 else ""
+            elapsed_val = str(r[2]) if len(r) > 2 else ""
+            event = str(r[8]) if len(r) > 8 else ""
 
             # 숫자 컨럼은 float 그대로 (Excel 숫자 형식)
             try:
-                bet_val = float(r[2]) if r[2] != "" else None
-                bal_val = float(r[3]) if r[3] != "" else None
-                win_val = float(r[4]) if r[4] != "" else None
-                delta_val = float(r[5]) if r[5] != "" else None
-                dbp_val = float(r[6]) if r[6] != "" else None
+                bet_val = float(r[3]) if r[3] != "" else None
+                bal_val = float(r[4]) if r[4] != "" else None
+                win_val = float(r[5]) if r[5] != "" else None
+                delta_val = float(r[6]) if r[6] != "" else None
+                dbp_val = float(r[7]) if r[7] != "" else None
             except (ValueError, TypeError):
-                bet_val = r[2] if len(r) > 2 else None
-                bal_val = r[3] if len(r) > 3 else None
-                win_val = r[4] if len(r) > 4 else None
-                delta_val = r[5] if len(r) > 5 else None
-                dbp_val = r[6] if len(r) > 6 else None
+                bet_val = r[3] if len(r) > 3 else None
+                bal_val = r[4] if len(r) > 4 else None
+                win_val = r[5] if len(r) > 5 else None
+                delta_val = r[6] if len(r) > 6 else None
+                dbp_val = r[7] if len(r) > 7 else None
 
-            rows.append([spin_val, time_val, bet_val, bal_val, win_val, delta_val, dbp_val, event])
+            rows.append([spin_val, time_val, elapsed_val, bet_val, bal_val, win_val, delta_val, dbp_val, event])
 
         df = pd.DataFrame(rows, columns=headers)
 
         # Append elapsed time row at the very bottom
         if self.elapsed_time:
-            elapsed_row = pd.DataFrame([["", "", "", "Total Time:", self.elapsed_time, "", "", ""]], columns=headers)
+            # Shift Total Time text column appropriately
+            elapsed_row = pd.DataFrame([["", "", "", "", "Total Time:", self.elapsed_time, "", "", ""]], columns=headers)
             df = pd.concat([df, elapsed_row], ignore_index=True)
 
         try:
             with pd.ExcelWriter(path, engine='openpyxl') as writer:
                 df.to_excel(writer, index=False, sheet_name='Data')
                 ws = writer.sheets['Data']
-                # 숫자 컨럼에 쉼표 포맷 적용 (Bet, Balance, Win, Δ Balance, Δ Bal+Bet = col C~G)
-                for col_letter in ['C', 'D', 'E', 'F', 'G']:
+                # 숫자 컨럼에 쉼표 포맷 적용 (Bet~Δ Bal+Bet = col D~H)
+                for col_letter in ['D', 'E', 'F', 'G', 'H']:
                     for cell in ws[col_letter][1:]:  # 헤더 제외
                         if cell.value is not None and isinstance(cell.value, (int, float)):
                             cell.number_format = '#,##0'
