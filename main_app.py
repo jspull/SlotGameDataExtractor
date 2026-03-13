@@ -445,7 +445,8 @@ class VideoPlayer(QWidget):
         try:
             import easyocr, torch
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            self.lbl_ocr_preview.setText("  OCR ▸ Initializing reader...")
+            msg = "GPU Accel" if device == 'cuda' else "CPU Mode"
+            self.lbl_ocr_preview.setText(f"  OCR ▸ Initializing reader ({msg})...")
             self.lbl_ocr_preview.show()
             from PyQt5.QtWidgets import QApplication
             QApplication.processEvents()
@@ -1179,10 +1180,10 @@ class MainWindow(QMainWindow):
         if self._preview_reader is None:
             try:
                 import easyocr, torch
-                device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                self.lbl_status.setText("Initializing OCR preview reader...")
+                device = 'cpu'
+                self.lbl_status.setText("Initializing OCR preview reader (CPU)...")
                 QApplication.processEvents()
-                self._preview_reader = easyocr.Reader(['en'], gpu=(device == 'cuda'))
+                self._preview_reader = easyocr.Reader(['en'], gpu=False)
                 self.lbl_status.setText("ROI set ✓ + OCR Preview ready → Press Start")
             except Exception:
                 self._preview_reader = None

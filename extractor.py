@@ -72,13 +72,41 @@ class ExtractorThread(QThread):
         reader = easyocr.Reader(['en'], gpu=(device == 'cuda'))
         return reader
 
+    def _init_clip_onnx(self, device):
+        """ONNX Runtime을 사용한 CLIP 초기화 (성능 최적화)"""
+        if self.roi_event is None:
+            return
+        try:
+            import onnxruntime as ort
+            from transformers import CLIPProcessor
+            
+            onnx_path = "models/onnx/clip_vision.onnx"
+            if not os.path.exists(onnx_path):
+                raise FileNotFoundError(f"ONNX model not found at {onnx_path}")
+
+            self.status_signal.emit("Loading CLIP ONNX model for high performance...")
+            
+            # 하드웨어 가속기 설정
+            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if device == 'cuda' else ['CPUExecutionProvider']
+            self._clip_session = ort.InferenceSession(onnx_path, providers=providers)
+            
+            self._clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+            
+            # 텍스트 프롬프트 사전 인코딩 (이 부분은 PyTorch transformers를 임시 사용하거나 별도 구현 가능)
+            # 현재는 분류를 위해 PyTorch CLIPModel을 백업으로 같이 로드함
+            self._init_clip(device)
+            
+        except Exception as e:
+            self.status_signal.emit(f"ONNX init failed: {e}. Falling back to PyTorch.")
+            self._init_clip(device)
+
     def _init_clip(self, device):
         """CLIP 모델 초기화 (Event ROI가 설정된 경우에만)"""
         if self.roi_event is None:
             return
         try:
             from transformers import CLIPProcessor, CLIPModel
-            self.status_signal.emit("Loading CLIP model for event detection...")
+            self.status_signal.emit("Loading CLIP PyTorch model...")
             self._clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
             self._clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
             self._clip_model = self._clip_model.to(device)
@@ -92,28 +120,52 @@ class ExtractorThread(QThread):
             self.roi_event = None
 
     def _classify_event(self, frame, device, easy_reader):
-        """CLIP 분류 및 OCR 교차 검증"""
-        if self._clip_model is None or self.roi_event is None:
+        """ONNX Runtime 또는 PyTorch를 사용하여 이벤트 분류"""
+        if self.roi_event is None:
             return ""
         try:
             ex, ey, ew, eh = self.roi_event
             roi_frame = frame[ey:ey+eh, ex:ex+ew]
-            
-            # ROI 필터 적용 (MainWindow.RoiFilterDialog.apply_roi_filter와 동일 로직)
             roi_frame = self._apply_roi_filter(roi_frame, self.roi_event_filter)
             
             rgb = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2RGB if len(roi_frame.shape) == 3 else cv2.COLOR_GRAY2RGB)
             pil_img = Image.fromarray(rgb)
-            image_inputs = self._clip_processor(images=pil_img, return_tensors="pt").to(device)
-            with torch.no_grad():
-                outputs = self._clip_model(**image_inputs, **self._clip_text_inputs)
-                probs = outputs.logits_per_image.softmax(dim=1).cpu().numpy()[0]
+            
+            # 1. ONNX 가용 시 ONNX로 추론
+            if hasattr(self, '_clip_session'):
+                inputs = self._clip_processor(images=pil_img, return_tensors="np")
+                pixel_values = inputs['pixel_values'].astype(np.float32)
+                
+                # ONNX 실행 (Vision Encoder)
+                ort_inputs = {self._clip_session.get_inputs()[0].name: pixel_values}
+                vision_outputs = self._clip_session.run(None, ort_inputs)
+                image_embeds = vision_outputs[0] # [1, 512]
+                
+                # 분류를 위해 텍스트 유사도 계산 (이 부분은 PyTorch 모델 활용)
+                import torch.nn.functional as F
+                with torch.no_grad():
+                    # 텍스트 임베딩 생성
+                    text_embeds = self._clip_model.get_text_features(**self._clip_text_inputs)
+                    image_embeds_pt = torch.from_numpy(image_embeds).to(device)
+                    
+                    # 정규화 및 유사도 측정
+                    image_embeds_pt = image_embeds_pt / image_embeds_pt.norm(p=2, dim=-1, keepdim=True)
+                    text_embeds = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)
+                    
+                    logit_scale = self._clip_model.logit_scale.exp()
+                    logits_per_image = logit_scale * image_embeds_pt @ text_embeds.t()
+                    probs = logits_per_image.softmax(dim=-1).cpu().numpy()[0]
+            else:
+                # 2. PyTorch 폴백
+                image_inputs = self._clip_processor(images=pil_img, return_tensors="pt").to(device)
+                with torch.no_grad():
+                    outputs = self._clip_model(**image_inputs, **self._clip_text_inputs)
+                    probs = outputs.logits_per_image.softmax(dim=1).cpu().numpy()[0]
+            
             top_idx = probs.argmax()
             normal_idx = len(self._event_labels) - 1
-            
             if top_idx != normal_idx and probs[top_idx] >= self.clip_threshold:
                 return self._event_names[top_idx]
-            
             return ""
         except Exception:
             return ""
@@ -147,14 +199,17 @@ class ExtractorThread(QThread):
 
     def run(self):
         try:
+            # 장치 설정 (GPU 우선, 없으면 CPU)
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
             gpu_msg = "GPU Accel" if device == 'cuda' else "CPU Mode"
-
-            self.status_signal.emit(f"Initializing EasyOCR ({gpu_msg}). Please wait...")
+            self.status_signal.emit(f"Initializing {gpu_msg} (EasyOCR & ONNX)...")
+            
+            # 1. EasyOCR
             easy_reader = self._init_easyocr(device)
-
-            # CLIP 초기화 (Event ROI 설정 시에만)
-            self._init_clip(device)
+            
+            # 2. CLIP (ONNX Runtime 적용)
+            self._init_clip_onnx(device)
+            
             event_capture_frame = None  # ROLLING_UP 진입 시 프레임 캡처용
 
             cap = cv2.VideoCapture(self.video_path)
