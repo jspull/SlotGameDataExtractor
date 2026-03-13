@@ -37,8 +37,8 @@ class ExtractorThread(QThread):
 
     def __init__(self, video_path, roi_bal, roi_win, roi_event=None, start_frame=0, 
                  clip_threshold=0.5, event_entries=None, bal_filter=None, fixed_bet=None,
-                 roi_bal_filter=None, roi_win_filter=None, stability_pct=0.5,
-                 drop_only_spin=False):
+                 roi_bal_filter=None, roi_win_filter=None, roi_event_filter=None,
+                 stability_pct=0.5, drop_only_spin=False):
         super().__init__()
         self.video_path = video_path
         self.roi_bal = roi_bal
@@ -50,6 +50,7 @@ class ExtractorThread(QThread):
         self.fixed_bet = fixed_bet
         self.roi_bal_filter = roi_bal_filter
         self.roi_win_filter = roi_win_filter
+        self.roi_event_filter = roi_event_filter
         self.stability_pct = stability_pct  # 안정 감지 임계값 (%)
         self.drop_only_spin = drop_only_spin  # Drop Only Spin 모드
         self._is_stopped = False
@@ -97,7 +98,11 @@ class ExtractorThread(QThread):
         try:
             ex, ey, ew, eh = self.roi_event
             roi_frame = frame[ey:ey+eh, ex:ex+ew]
-            rgb = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2RGB)
+            
+            # ROI 필터 적용 (MainWindow.RoiFilterDialog.apply_roi_filter와 동일 로직)
+            roi_frame = self._apply_roi_filter(roi_frame, self.roi_event_filter)
+            
+            rgb = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2RGB if len(roi_frame.shape) == 3 else cv2.COLOR_GRAY2RGB)
             pil_img = Image.fromarray(rgb)
             image_inputs = self._clip_processor(images=pil_img, return_tensors="pt").to(device)
             with torch.no_grad():
@@ -112,6 +117,33 @@ class ExtractorThread(QThread):
             return ""
         except Exception:
             return ""
+
+    def _apply_roi_filter(self, img, filter_dict):
+        """이미지 전처리 필터 적용 (MainApp의 로직과 동일)"""
+        if filter_dict is None or not filter_dict:
+            return img
+        
+        work_img = img.astype(np.float64)
+        contrast = filter_dict.get("contrast", 100) / 100.0
+        brightness = filter_dict.get("brightness", 0)
+        
+        # 1. 밝기/대비 적용
+        work_img = work_img * contrast + brightness
+        work_img = np.clip(work_img, 0, 255).astype(np.uint8)
+        
+        # 2. 흑백 변환 여부
+        if filter_dict.get("grayscale_on", 0) and len(work_img.shape) == 3:
+            work_img = cv2.cvtColor(work_img, cv2.COLOR_BGR2GRAY)
+            
+        # 3. 이진화 적용
+        if filter_dict.get("threshold_on", 0):
+            if len(work_img.shape) == 3:
+                work_img = cv2.cvtColor(work_img, cv2.COLOR_BGR2GRAY)
+            bs = filter_dict.get("block_size", 11)
+            if bs % 2 == 0: bs += 1
+            work_img = cv2.adaptiveThreshold(work_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, bs, 2)
+            
+        return work_img
 
     def run(self):
         try:

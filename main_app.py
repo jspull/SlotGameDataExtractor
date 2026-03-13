@@ -123,24 +123,29 @@ class ClickableSlider(QSlider):
 
 # ── ROI Filter Tuning Dialog ────────────────────────────────────────
 class RoiFilterDialog(QDialog):
-    """ROI별 밝기/대비/이진화 필터를 슬라이더로 조정하고 실시간 미리보기하는 다이얼로그 (v44 포팅)"""
-    def __init__(self, roi_type_label, roi_gray_img, current_filter=None, parent=None):
+    """ROI별 밝기/대비/이진화 필터를 슬라이더로 조정하고 실시간 미리보기하는 다이얼로그"""
+    def __init__(self, roi_type_label, roi_img, current_filter=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"ROI Filter Tuning ({roi_type_label})")
-        self.setMinimumSize(520, 450)
-        self.roi_gray = roi_gray_img
-        self.result_filter = None  # None = 취소, dict = 확정
+        self.setMinimumSize(520, 480)
+        self.roi_img = roi_img
+        self.result_filter = None
 
-        ref = {"brightness": 0, "contrast": 100, "threshold_on": 0, "block_size": 11}
+        # 기본 필터 구성
+        ref = {"brightness": 0, "contrast": 100, "threshold_on": 0, "block_size": 11, "grayscale_on": 0}
         if current_filter:
             ref.update(current_filter)
+        
+        # Balance/Win은 항상 Grayscale 강제 (레거시 지원 및 정확도용)
+        if roi_type_label in ["Balance", "Win"]:
+            ref["grayscale_on"] = 1
 
         layout = QVBoxLayout(self)
 
         # 미리보기 영역
         self.preview_label = QLabel("Preview")
         self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumSize(480, 130)
+        self.preview_label.setMinimumSize(480, 150)
         self.preview_label.setStyleSheet("background-color: #222; border: 1px solid #333; border-radius: 4px;")
         layout.addWidget(self.preview_label)
 
@@ -170,12 +175,13 @@ class RoiFilterDialog(QDialog):
         row2.addWidget(self.lbl_contrast_val)
         layout.addLayout(row2)
 
-        # 이진화 체크 + 블록크기
+        # 추가 옵션 행 (이진화, 흑백)
         row3 = QHBoxLayout()
         self.chk_threshold = QCheckBox("이진화")
         self.chk_threshold.setChecked(bool(ref["threshold_on"]))
         self.chk_threshold.stateChanged.connect(lambda: self._update_preview())
         row3.addWidget(self.chk_threshold)
+        
         row3.addWidget(QLabel("블록크기:"))
         self.spin_block = QSpinBox()
         self.spin_block.setRange(3, 31)
@@ -183,6 +189,16 @@ class RoiFilterDialog(QDialog):
         self.spin_block.setValue(ref["block_size"])
         self.spin_block.valueChanged.connect(lambda: self._update_preview())
         row3.addWidget(self.spin_block)
+        
+        # 흑백(Grayscale) 토글 - 입력이 컬러인 경우에만 의미 있음
+        self.chk_grayscale = QCheckBox("Grayscale(흑백)")
+        self.chk_grayscale.setChecked(bool(ref["grayscale_on"]))
+        self.chk_grayscale.stateChanged.connect(lambda: self._update_preview())
+        # Balance/Win은 흑백 고정
+        if roi_type_label in ["Balance", "Win"]:
+            self.chk_grayscale.setEnabled(False)
+        row3.addWidget(self.chk_grayscale)
+        
         row3.addStretch()
         layout.addLayout(row3)
 
@@ -202,47 +218,66 @@ class RoiFilterDialog(QDialog):
 
     def _build_filter(self):
         bs = self.spin_block.value()
-        if bs % 2 == 0:
-            bs += 1
+        if bs % 2 == 0: bs += 1
         return {
             "brightness": self.slider_brightness.value(),
             "contrast": self.slider_contrast.value(),
             "threshold_on": 1 if self.chk_threshold.isChecked() else 0,
+            "grayscale_on": 1 if self.chk_grayscale.isChecked() else 0,
             "block_size": max(3, bs)
         }
 
     @staticmethod
-    def apply_roi_filter(gray_img, filter_dict):
-        """필터를 적용한 이미지 반환 (extractor에서도 동일 로직 사용)"""
+    def apply_roi_filter(img, filter_dict):
+        """필터를 적용한 이미지 반환 (RGB/Gray 모두 대응)"""
         if filter_dict is None or not filter_dict:
-            return gray_img
-        img = gray_img.astype(np.float64)
+            return img
+        
+        work_img = img.astype(np.float64)
         contrast = filter_dict.get("contrast", 100) / 100.0
         brightness = filter_dict.get("brightness", 0)
-        img = img * contrast + brightness
-        img = np.clip(img, 0, 255).astype(np.uint8)
+        
+        # 1. 밝기/대비 적용
+        work_img = work_img * contrast + brightness
+        work_img = np.clip(work_img, 0, 255).astype(np.uint8)
+        
+        # 2. 흑백 변환 여부
+        if filter_dict.get("grayscale_on", 0) and len(work_img.shape) == 3:
+            work_img = cv2.cvtColor(work_img, cv2.COLOR_BGR2GRAY)
+            
+        # 3. 이진화 적용 (이미지가 흑백인 상태여야 함)
         if filter_dict.get("threshold_on", 0):
+            if len(work_img.shape) == 3:
+                work_img = cv2.cvtColor(work_img, cv2.COLOR_BGR2GRAY)
             bs = filter_dict.get("block_size", 11)
-            if bs % 2 == 0:
-                bs += 1
-            img = cv2.adaptiveThreshold(img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, bs, 2)
-        return img
+            if bs % 2 == 0: bs += 1
+            work_img = cv2.adaptiveThreshold(work_img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, bs, 2)
+            
+        return work_img
 
     def _update_preview(self):
         fd = self._build_filter()
-        out = RoiFilterDialog.apply_roi_filter(self.roi_gray.copy(), fd)
+        out = RoiFilterDialog.apply_roi_filter(self.roi_img.copy(), fd)
         h, w = out.shape[:2]
-        canvas_w, canvas_h = 480, 120
+        canvas_w, canvas_h = 480, 150
         scale = min(canvas_w / max(w, 1), canvas_h / max(h, 1), 5.0)
         nw, nh = max(int(w * scale), 1), max(int(h * scale), 1)
         resized = cv2.resize(out, (nw, nh), interpolation=cv2.INTER_NEAREST)
+        
         if len(resized.shape) == 2:
             rgb = cv2.cvtColor(resized, cv2.COLOR_GRAY2RGB)
         else:
-            rgb = resized
+            # BGR to RGB
+            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            
         h2, w2, ch = rgb.shape
-        qimg = QImage(rgb.data, w2, h2, ch * w2, QImage.Format_RGB888)
+        bytes_per_line = ch * w2
+        qimg = QImage(rgb.data, w2, h2, bytes_per_line, QImage.Format_RGB888)
         self.preview_label.setPixmap(QPixmap.fromImage(qimg))
+
+    def _on_confirm(self):
+        self.result_filter = self._build_filter()
+        self.accept()
 
     def _on_confirm(self):
         self.result_filter = self._build_filter()
@@ -672,6 +707,7 @@ class MainWindow(QMainWindow):
         self.roi_event = None  # Event detection ROI
         self.roi_bal_filter = None  # Balance OCR 전처리 필터 dict
         self.roi_win_filter = None  # Win OCR 전처리 필터 dict
+        self.roi_event_filter = None # Event CLIP 전처리 필터 dict
         root_layout.setSpacing(8)
 
         # ── Title ──
@@ -881,9 +917,13 @@ class MainWindow(QMainWindow):
         btn_add_evt.clicked.connect(self._add_event_row)
         btn_del_evt = QPushButton("➖ Delete")
         btn_del_evt.clicked.connect(self._del_event_row)
+        btn_import_evt = QPushButton("📥 Import Events")
+        btn_import_evt.clicked.connect(self.import_events)
+        btn_export_evt = QPushButton("💾 Export Events")
+        btn_export_evt.clicked.connect(self.export_events)
         btn_reset_evt = QPushButton("🔄 Reset Default")
         btn_reset_evt.clicked.connect(self._load_default_events)
-        for b in [btn_add_evt, btn_del_evt, btn_reset_evt]:
+        for b in [btn_add_evt, btn_del_evt, btn_import_evt, btn_export_evt, btn_reset_evt]:
             b.setMinimumHeight(28)
             evt_btn_bar.addWidget(b)
         evt_btn_bar.addStretch()
@@ -1118,8 +1158,20 @@ class MainWindow(QMainWindow):
                 self.roi_win_filter = win_dlg.result_filter
             else:
                 self.roi_win_filter = None
-            self.btn_start.setEnabled(True)
-            self.lbl_status.setText(f"ROI set ✓ (Bal, Win{', Event' if self.roi_event else ''}) → Press Start")
+            
+        # ── Event ROI 필터 튜닝 다이얼로그 ──
+        if self.roi_event:
+            ex, ey, ew, eh = self.roi_event
+            event_crop = frame[ey:ey+eh, ex:ex+ew] # CLIP은 컬러가 유리하므로 컬러 전달
+            evt_dlg = RoiFilterDialog("Event", event_crop, self.roi_event_filter, self)
+            if evt_dlg.exec_() == QDialog.Accepted:
+                self.roi_event_filter = evt_dlg.result_filter
+            else:
+                self.roi_event_filter = None
+
+        self.btn_start.setEnabled(True)
+        msg = f"ROI set ✓ (Balance{', Win' if self.roi_win else ''}{', Event' if self.roi_event else ''}) → Press Start"
+        self.lbl_status.setText(msg)
 
         # VideoPlayer에 ROI 전달 및 EasyOCR lazy-init
         self.player._ocr_roi_bal = self.roi_bal
@@ -1201,6 +1253,7 @@ class MainWindow(QMainWindow):
             fixed_bet=fixed_bet_val,
             roi_bal_filter=self.roi_bal_filter,
             roi_win_filter=self.roi_win_filter,
+            roi_event_filter=self.roi_event_filter,
             stability_pct=self.spin_stability.value(),
             drop_only_spin=self.chk_drop_only.isChecked()
         )
@@ -1671,6 +1724,34 @@ class MainWindow(QMainWindow):
         if selected >= 0:
             self.event_table.removeRow(selected)
 
+    def import_events(self):
+        """이벤트 목록을 JSON 파일에서 불러옵니다."""
+        path, _ = QFileDialog.getOpenFileName(self, "Import Events", "", "JSON Files (*.json)")
+        if not path: return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                self._load_events_from_list(data)
+                QMessageBox.information(self, "Import", "Events imported successfully.")
+        except Exception as e:
+            QMessageBox.critical(self, "Import Error", str(e))
+
+    def export_events(self):
+        """이벤트 목록을 JSON 파일로 저장합니다."""
+        entries = self._get_event_entries()
+        if not entries:
+            QMessageBox.warning(self, "Warning", "내보낼 이벤트 행이 없습니다.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export Events", "events.json", "JSON Files (*.json)")
+        if not path: return
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(entries, f, ensure_ascii=False, indent=4)
+            QMessageBox.information(self, "Export", "Events exported successfully.")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
+
     def reset_all(self):
         """전체 리셋: 파일·ROI·데이터·프리뷰·이벤트 테이블 초기화."""
         # Stop thread if running
@@ -1689,6 +1770,7 @@ class MainWindow(QMainWindow):
         self.roi_event = None
         self.roi_bal_filter = None
         self.roi_win_filter = None
+        self.roi_event_filter = None
         self.elapsed_time = ""
         self.prev_balance = None
         self.prev_spin_sec = None
@@ -1696,6 +1778,10 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText("Ready")
         self.txt_start_time.reset()  # ★ 시작시간도 리셋
         self.spin_clip_th.setValue(0.5)
+        self.txt_bal_filter.setText("1,000,000")
+        self.txt_fixed_bet.setText("")
+        self.spin_stability.setValue(0.5)
+        self.chk_drop_only.setChecked(False)
         self.btn_select.setEnabled(True)
         self.btn_roi.setEnabled(False)
         self.btn_start.setEnabled(False)
@@ -1831,9 +1917,14 @@ class MainWindow(QMainWindow):
             "roi_event": list(self.roi_event) if self.roi_event else None,
             "roi_bal_filter": self.roi_bal_filter,
             "roi_win_filter": self.roi_win_filter,
+            "roi_event_filter": self.roi_event_filter,
             "data_rows": self.data_rows,
             "start_time": self.txt_start_time.text(),
             "clip_threshold": self.spin_clip_th.value(),
+            "bal_filter": self.txt_bal_filter.text(),
+            "fixed_bet": self.txt_fixed_bet.text(),
+            "stability_pct": self.spin_stability.value(),
+            "drop_only_spin": self.chk_drop_only.isChecked(),
             "event_entries": self._get_event_entries()
         }
 
@@ -1869,6 +1960,7 @@ class MainWindow(QMainWindow):
             if re_: self.roi_event = tuple(re_)
             self.roi_bal_filter = data.get("roi_bal_filter")
             self.roi_win_filter = data.get("roi_win_filter")
+            self.roi_event_filter = data.get("roi_event_filter")
 
             if self.roi_bal:
                 self.btn_start.setEnabled(True)
@@ -1880,6 +1972,11 @@ class MainWindow(QMainWindow):
             
             ct = data.get("clip_threshold", 0.5)
             self.spin_clip_th.setValue(ct)
+
+            self.txt_bal_filter.setText(data.get("bal_filter", "1,000,000"))
+            self.txt_fixed_bet.setText(data.get("fixed_bet", ""))
+            self.spin_stability.setValue(data.get("stability_pct", 0.5))
+            self.chk_drop_only.setChecked(data.get("drop_only_spin", False))
 
             # 이벤트 엔트리 복원
             saved_events = data.get("event_entries", None)
